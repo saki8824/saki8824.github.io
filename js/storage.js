@@ -657,6 +657,32 @@ const MindLinkStorage = (() => {
     });
   }
 
+  // 重みが threshold 以下の likedStyleSummaries を IndexedDB から削除
+  async function pruneOldLikedStyleSummaries(threshold = 0.09) {
+    const summaries = await getLikedStyleSummaries();
+    if (!summaries || summaries.length === 0) return;
+    const now = Date.now();
+    const toDelete = summaries.filter(s => {
+      const weight = 1 / ((now - new Date(s.date)) / 86400000 + 1);
+      return weight <= threshold;
+    });
+    if (toDelete.length === 0) return;
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(LIKED_STYLE_SUMMARIES_STORE, 'readwrite');
+      const store = tx.objectStore(LIKED_STYLE_SUMMARIES_STORE);
+      let completed = 0;
+      for (const s of toDelete) {
+        const req = store.delete(s.date);
+        req.onsuccess = () => {
+          completed++;
+          if (completed === toDelete.length) resolve(toDelete.length);
+        };
+        req.onerror = () => reject(req.error);
+      }
+    });
+  }
+
   // ── Final Return ──
 
   return {
@@ -667,7 +693,7 @@ const MindLinkStorage = (() => {
     getMessages, setMessages, addMessage,
     getMemories, setMemories, addMemory, deleteMemory, updateMemory,
     addLikedMessage, getLikedMessages, clearLikedMessages,
-    saveLikedStyleSummary, getLikedStyleSummaries,
+    saveLikedStyleSummary, getLikedStyleSummaries, pruneOldLikedStyleSummaries,
     getPersonas, setPersonas, savePersona, deletePersona, getPersona, getDefaultPersona,
     getActivePersonaId, setActivePersonaId,
     getGlobalContext, setGlobalContext,

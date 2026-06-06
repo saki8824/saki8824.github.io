@@ -133,6 +133,16 @@ ${likedList.slice(0, 10000)}`;
         console.warn('[MindLink] いいねスタイル省察 failed:', styleErr);
       }
 
+      // ── 古いいいねスタイル要約を自動削除（重み0.09以下 = 約10日以上前） ──
+      try {
+        const pruned = await MindLinkStorage.pruneOldLikedStyleSummaries(0.09);
+        if (pruned > 0) {
+          console.log(`[MindLink] 古いスタイル要約を${pruned}件削除しました`);
+        }
+      } catch (pruneErr) {
+        console.warn('[MindLink] スタイル要約の自動削除に失敗:', pruneErr);
+      }
+
       // リストの再描画
       await renderReflectionList();
 

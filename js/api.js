@@ -478,6 +478,7 @@ const MindLinkAPI = (() => {
                     ...s,
                     weight: 1 / ((now - new Date(s.date)) / 86400000 + 1)
                   }))
+                  .filter(s => s.weight > 0.09)
                   .sort((a, b) => b.weight - a.weight);
                 const lines = weighted.map(s => `・${s.date}：${s.summary}`).join('\n');
                 likedStylePrompt = `\n\n【優先度4：ユーザーが好むスタイル傾向（新しい順）】\n${lines}\n\n上記の傾向を参考に、自然な形で言い回しや語尾に反映してください。\nただし、傾向に縛られすぎず会話の流れを優先してください。`;
