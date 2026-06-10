@@ -224,7 +224,7 @@ const MindLinkStorage = (() => {
     userBio: '',
     googleClientId: '',
     googleClientSecret: '',
-    summaryModel: 'gemini-3.5-flash',
+    summaryModel: 'gemini-3.1-flash-lite',
   };
 
   function getSettings() {

@@ -22,7 +22,7 @@ const MindLinkAPI = (() => {
     const apiKey = await MindLinkAuth.getApiKey('gemini');
     if (!apiKey) throw new Error('APIキー未設定');
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key=${apiKey}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -61,7 +61,7 @@ const MindLinkAPI = (() => {
     if (!apiKey) throw new Error('APIキー未設定');
 
     const settings = MindLinkStorage.getSettings();
-    const model = usePro ? 'gemini-2.5-pro' : (settings.summaryModel || 'gemini-2.5-flash');
+    const model = usePro ? 'gemini-3.1-flash-lite' : (settings.summaryModel || 'gemini-2.5-flash');
     const url = `${BASE_URL}/models/${model}:generateContent?key=${apiKey}`;
 
     const response = await fetch(url, {
@@ -93,7 +93,7 @@ const MindLinkAPI = (() => {
     if (!apiKey) throw new Error('APIキー未設定');
 
     const settings = MindLinkStorage.getSettings();
-    const model = settings.summaryModel || 'gemini-2.5-flash';
+    const model = settings.summaryModel || 'gemini-3.1-flash-lite';
     const url = `${BASE_URL}/models/${model}:generateContent?key=${apiKey}`;
 
     const parts = [];
@@ -157,7 +157,7 @@ const MindLinkAPI = (() => {
       if (!dailyLog.trim()) return;
 
       const settings = MindLinkStorage.getSettings();
-      const model = settings.summaryModel || 'gemini-2.5-flash';
+      const model = settings.summaryModel || 'gemini-3.1-flash-lite';
       const url = `${BASE_URL}/models/${model}:generateContent?key=${apiKey}`;
       const prompt = `以下の会話を要約してください。\n必ず以下の3セクションで構造化すること：\n\n📅 今日の出来事\n記念日・イベント・特別な出来事を具体的に記述。\n日付・固有名詞・場所は省略しない。\n\n💬 会話の流れ\nどんな話題で盛り上がったか、重要なやりとりや決定事項。\n\n💕 感情メモ\nユーザーの気持ち・感情の変化、ジユンとの会話の雰囲気・トーン。\n\n合計500文字以内。箇条書き推奨。\n\n${dailyLog.slice(0, 8000)}`;
 
@@ -476,14 +476,29 @@ const MindLinkAPI = (() => {
               const lastUserMsg = [...formattedMessages].reverse().find(m => m.role === 'user');
               const queryText = lastUserMsg ? lastUserMsg.parts.map(p => p.text || "").join(" ") : "";
               if (queryText) {
-                const refs = await window.MindLinkRAG.searchReflections(queryText, 6);
-                if (refs.length > 0) {
-                  const knowledge = refs.filter(r => r.sectionType === 'user_knowledge' || r.sectionType === 'ai_growth').slice(0, 3);
-                  const episodes  = refs.filter(r => r.sectionType === 'episode' || !r.sectionType).slice(0, 2);
-                  const ragParts  = [];
-                  if (knowledge.length > 0) ragParts.push('【最新のユーザー理解・AI成長メモ（新しい情報を優先）】\n' + knowledge.map(r => `* ${r.content}`).join('\n'));
-                  if (episodes.length  > 0) ragParts.push('【過去の思い出・出来事（参考情報）】\n'     + episodes.map(r => `* ${r.content}`).join('\n'));
-                  if (ragParts.length  > 0) ragPrompt = '\n\n【優先度3：過去の自己省察（※古い情報の可能性があるため参考程度）】\n' + ragParts.join('\n\n');
+                try {
+                  // Embeddingは1回だけ生成し、両検索で使い回す（API二重呼び出しの解消）
+                  const queryEmbedding = await window.MindLinkAPI.getEmbedding(queryText);
+                  // searchResearchThreads が未定義（古いrag.js等）でも継続できるよう存在チェック
+                  const hasResearchThreads = typeof window.MindLinkRAG.searchResearchThreads === 'function';
+                  const [refs, researchThreads] = await Promise.all([
+                    window.MindLinkRAG.searchReflections(queryText, 6, queryEmbedding),
+                    hasResearchThreads
+                      ? window.MindLinkRAG.searchResearchThreads(queryText, 2, queryEmbedding)
+                      : Promise.resolve([]),
+                  ]);
+                  if (refs.length > 0 || researchThreads.length > 0) {
+                    const knowledge = refs.filter(r => r.sectionType === 'user_knowledge' || r.sectionType === 'ai_growth').slice(0, 3);
+                    const episodes  = refs.filter(r => r.sectionType === 'episode' || !r.sectionType).slice(0, 2);
+                    const ragParts  = [];
+                    if (knowledge.length > 0) ragParts.push('【最新のユーザー理解・AI成長メモ（新しい情報を優先）】\n' + knowledge.map(r => `* ${r.content}`).join('\n'));
+                    if (episodes.length  > 0) ragParts.push('【過去の思い出・出来事（参考情報）】\n'     + episodes.map(r => `* ${r.content}`).join('\n'));
+                    if (researchThreads.length > 0) ragParts.push('【未解決スレッド・継続的関心（過去に気になっていたこと）】\n' + researchThreads.map(r => `* ${r.content}`).join('\n'));
+                    if (ragParts.length  > 0) ragPrompt = '\n\n【優先度3：過去の自己省察（※古い情報の可能性があるため参考程度）】\n' + ragParts.join('\n\n');
+                  }
+                } catch (ragErr) {
+                  // RAG構築失敗時はragPromptを空のままにし、streamChatを継続させる
+                  console.warn('[MindLink] RAG prompt build failed:', ragErr);
                 }
               }
             }

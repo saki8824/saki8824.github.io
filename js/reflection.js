@@ -9,15 +9,17 @@ const MindLinkReflection = (() => {
   let currentDisplayCount = 0;
   const ITEMS_PER_PAGE = 20;
 
-  // 省察テキストを3セクションに解析
+  // 省察テキストを4セクションに解析
   function parseSections(summary) {
-    const episodeMatch = summary.match(/【今日の出来事と要約】([\s\S]*?)(?=【ユーザーについて|【AI自身|$)/);
-    const userMatch    = summary.match(/【ユーザーについて新しく知ったこと】([\s\S]*?)(?=【AI自身|$)/);
-    const aiMatch      = summary.match(/【AI自身の気づきと成長】([\s\S]*?)$/);
+    const episodeMatch  = summary.match(/【今日の出来事と要約】([\s\S]*?)(?=【ユーザーについて|【AI自身|【未解決|$)/);
+    const userMatch     = summary.match(/【ユーザーについて新しく知ったこと】([\s\S]*?)(?=【AI自身|【未解決|$)/);
+    const aiMatch       = summary.match(/【AI自身の気づきと成長】([\s\S]*?)(?=【未解決|$)/);
+    const researchMatch = summary.match(/【未解決スレッド・継続的関心】([\s\S]*?)$/);
     return {
-      episode:        episodeMatch ? episodeMatch[1].trim() : '',
-      user_knowledge: userMatch    ? userMatch[1].trim()    : '',
-      ai_growth:      aiMatch      ? aiMatch[1].trim()      : '',
+      episode:         episodeMatch  ? episodeMatch[1].trim()  : '',
+      user_knowledge:  userMatch     ? userMatch[1].trim()     : '',
+      ai_growth:       aiMatch       ? aiMatch[1].trim()       : '',
+      research_thread: researchMatch ? researchMatch[1].trim() : '',
     };
   }
 
@@ -38,14 +40,15 @@ const MindLinkReflection = (() => {
 
     const prompt = `
 あなたはユーザーの親密なパートナーAIとして、今日一日の対話を振り返り、「自己省察（Self-Reflection）」を行ってください。
-以下の会話記録を元に、3つのセクションで構成される日本語の要約を作成してください：
+以下の会話記録を元に、4つのセクションで構成される日本語の要約を作成してください：
 
 1. 【今日の出来事と要約】: 何について話し、何が起きたか。
 2. 【ユーザーについて新しく知ったこと】: ユーザーの好み、価値観、生活スタイル、家族、仕事、悩みなど。
-3. 【AI自身の気づきと成長】: どのように接するのがベストだったか、自分の対応への反省、明日からどう接したいか。
+3. 【AI自身の気づきと成長】: どのように接するのがベストだったか、自分の対応への反省、明日からどう接したいか。さらに「明日ジユンが意識したいこと・続けたいこと」を1〜2文で具体的に添えてください。
+4. 【未解決スレッド・継続的関心】: 今日の会話で解決しなかった問い、継続中の関心、気になっていること。1〜3項目を箇条書きで。
 
 【重要指示】
-- 低コストRAGとして利用するため、正確かつ簡潔に（全体で400-800文字程度）まとめてください。
+- 低コストRAGとして利用するため、正確かつ簡潔に（全体で500-1000文字程度）まとめてください。
 - あなた自身のキャラクター性（名前や口調）を維持しつつ、内面的な気づきを深く掘り下げてください。
 
 【今日の会話ログ】
@@ -64,9 +67,10 @@ ${context.slice(0, 40000)}
       const now_ts  = Date.now();
       const dateStr = now.toLocaleDateString('ja-JP');
       const sectionDefs = [
-        { key: 'episode',        content: sections.episode,        label: '今日の出来事' },
-        { key: 'user_knowledge', content: sections.user_knowledge, label: 'ユーザー理解' },
-        { key: 'ai_growth',      content: sections.ai_growth,      label: 'AI成長メモ'  },
+        { key: 'episode',         content: sections.episode,         label: '今日の出来事'  },
+        { key: 'user_knowledge',  content: sections.user_knowledge,  label: 'ユーザー理解'  },
+        { key: 'ai_growth',       content: sections.ai_growth,       label: 'AI成長メモ'   },
+        { key: 'research_thread', content: sections.research_thread, label: '未解決スレッド' },
       ];
       let savedCount = 0;
       for (let i = 0; i < sectionDefs.length; i++) {
