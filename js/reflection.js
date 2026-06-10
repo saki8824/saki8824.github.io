@@ -207,7 +207,13 @@ ${likedList.slice(0, 10000)}`;
 
     if (reset) {
       cachedReflections = await MindLinkStorage.getReflections();
-      
+
+      // liked_topic / liked_insight は裏方（RAG注入専用）のため記憶ノートには表示しない
+      // ※ 保存・RAG検索・重み付け・エクスポートには影響しない（表示のみ除外）
+      cachedReflections = cachedReflections.filter(r =>
+        r.sectionType !== 'liked_topic' && r.sectionType !== 'liked_insight'
+      );
+
       // 日付順（降順）に並び替え
       cachedReflections.sort((a, b) => b.createdAt - a.createdAt);
       currentDisplayCount = 0;
