@@ -10,12 +10,14 @@ const MindLinkStorage = (() => {
   
   // ── IndexedDB Helper (Stability for large RAG data) ──
   const DB_NAME = 'MindLinkDB';
-  const DB_VERSION = 4;
+  const DB_VERSION = 5;
   const STORE_NAME = 'reflections';
   const TOKEN_STORE = 'secure_tokens';
   const DAILY_SUMMARY_STORE = 'daily_summary';
   const LIKED_MESSAGES_STORE = 'likedMessages';
   const LIKED_STYLE_SUMMARIES_STORE = 'likedStyleSummaries';
+  const FITNESS_LOGS_STORE = 'fitnessLogs';
+  const FITNESS_MENUS_STORE = 'fitnessMenus';
   let _db = null;
 
   async function openDB() {
@@ -38,6 +40,12 @@ const MindLinkStorage = (() => {
         }
         if (!db.objectStoreNames.contains(LIKED_STYLE_SUMMARIES_STORE)) {
           db.createObjectStore(LIKED_STYLE_SUMMARIES_STORE, { keyPath: 'date' });
+        }
+        if (!db.objectStoreNames.contains(FITNESS_LOGS_STORE)) {
+          db.createObjectStore(FITNESS_LOGS_STORE, { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains(FITNESS_MENUS_STORE)) {
+          db.createObjectStore(FITNESS_MENUS_STORE, { keyPath: 'id' });
         }
       };
       request.onsuccess = (e) => { _db = e.target.result; resolve(_db); };
@@ -635,6 +643,94 @@ const MindLinkStorage = (() => {
     });
   }
 
+  // ── Fitness Logs（日次フィットネス記録・1日1件・同日上書き） ──
+  async function getFitnessLogs() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(FITNESS_LOGS_STORE, 'readonly');
+      const req = tx.objectStore(FITNESS_LOGS_STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function getFitnessLogByDate(date) {
+    const logs = await getFitnessLogs();
+    return logs.find(l => l.date === date) || null;
+  }
+
+  async function saveFitnessLog(log) {
+    const db = await openDB();
+    // 同日既存レコードがあれば id / createdAt を引き継いで上書き（1日1件）
+    const existing = await getFitnessLogByDate(log.date);
+    if (existing) {
+      log.id = existing.id;
+      log.createdAt = existing.createdAt;
+    } else {
+      log.id = log.id || 'fitness_' + Date.now();
+      log.createdAt = log.createdAt || Date.now();
+    }
+    log.updatedAt = Date.now();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(FITNESS_LOGS_STORE, 'readwrite');
+      const req = tx.objectStore(FITNESS_LOGS_STORE).put(log);
+      req.onsuccess = () => resolve(log);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function deleteFitnessLog(id) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(FITNESS_LOGS_STORE, 'readwrite');
+      const req = tx.objectStore(FITNESS_LOGS_STORE).delete(id);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  // ── Fitness Menus（登録済みメニュー：筋トレ/有酸素） ──
+  async function getFitnessMenus() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(FITNESS_MENUS_STORE, 'readonly');
+      const req = tx.objectStore(FITNESS_MENUS_STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function saveFitnessMenu(menu) {
+    const db = await openDB();
+    menu.id = menu.id || 'menu_' + Date.now();
+    menu.createdAt = menu.createdAt || Date.now();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(FITNESS_MENUS_STORE, 'readwrite');
+      const req = tx.objectStore(FITNESS_MENUS_STORE).put(menu);
+      req.onsuccess = () => resolve(menu);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function deleteFitnessMenu(id) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(FITNESS_MENUS_STORE, 'readwrite');
+      const req = tx.objectStore(FITNESS_MENUS_STORE).delete(id);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  // ── Fitness Profile（身長など基本情報・専用localStorageキー） ──
+  function getFitnessProfile() {
+    return get('fitnessProfile', { height: null });
+  }
+  function setFitnessProfile(partial) {
+    const current = getFitnessProfile();
+    return set('fitnessProfile', { ...current, ...partial });
+  }
+
   // ── Final Return ──
 
   return {
@@ -654,6 +750,9 @@ const MindLinkStorage = (() => {
     exportRAGData, importRAGData,
     getDailySummary, saveDailySummary, deleteDailySummary,
     getCalendarEvents, saveCalendarEvent, deleteCalendarEvent, updateCalendarEvent, getCalendarEventsForDate,
+    getFitnessLogs, getFitnessLogByDate, saveFitnessLog, deleteFitnessLog,
+    getFitnessMenus, saveFitnessMenu, deleteFitnessMenu,
+    getFitnessProfile, setFitnessProfile,
   };
 })();
 

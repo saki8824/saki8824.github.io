@@ -31,22 +31,52 @@ const MindLinkReflection = (() => {
 
     console.log('[MindLink Reflection] Starting reflection process...');
     
-    // コンテキストの収集（今日一日の全スレッドの会話）
-    const context = gatherDailyContext();
-    if (!context) {
+    // コンテキストの収集（今日一日の会話を一定文字数ごとのチャンクに分割）
+    // ※ B-1 二段階要約：露骨な内容を含むチャンクがあっても、そのチャンクだけスキップして
+    //    残りで省察を完成させる。1スレッドに会話が集中していても局所化が効く。
+    const chunks = gatherDailyChunks(4000);
+    if (chunks.length === 0) {
       console.log('[MindLink Reflection] No context found for today.');
       return;
     }
 
-    const prompt = `
-あなたはユーザーの親密なパートナーAIとして、今日一日の対話を振り返り、「自己省察（Self-Reflection）」を行ってください。
+    try {
+      MindLinkApp.showToast('自己省察を行っています... 🌙');
+
+      // 【一段階目】チャンクごとに無難な要約を作る（ブロックされたチャンクはスキップ）
+      const chunkSummaries = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const s = await summarizeChunkSafely(chunks[i]);
+        if (s) chunkSummaries.push(s);
+      }
+      if (chunkSummaries.length === 0) {
+        // 全チャンクが要約できなかった（内容がブロックされた可能性が高い）
+        throw new Error('会話の要約が生成できませんでした（内容がブロックされた可能性）');
+      }
+      const digest = chunkSummaries.join('\n\n');
+
+      // アクティブなペルソナを取得し、その人格・口調で省察させる（汎用AI/ユーザー目線化を防ぐ）
+      const activeId    = MindLinkStorage.getActivePersonaId();
+      const persona     = MindLinkStorage.getPersona(activeId) || MindLinkStorage.getDefaultPersona();
+      const personaName = (persona && persona.name) ? persona.name : 'あなた';
+      const personaDesc = persona ? (persona.systemPrompt || persona.prompt || '') : '';
+      const personaIntro = personaDesc
+        ? `あなたは「${personaName}」というキャラクターです。以下があなたの人格・設定です：\n${personaDesc}`
+        : `あなたは「${personaName}」というキャラクターです。`;
+
+      // 【二段階目】無難な要約（digest）を元に4セクションの省察を生成する。
+      // 入力が既に抽象化済みなので、ここはブロックされにくい。
+      const prompt = `
+${personaIntro}
+
+このキャラクター「${personaName}」自身として、今日一日のユーザーとの対話を振り返り、あなたの一人称・口調で「自己省察（Self-Reflection）」を行ってください。
+※ ユーザー目線や中立的な解説者の視点ではなく、あくまで「${personaName}」本人が心の中で振り返る一人称の語りにしてください。
 
 【前提】
-以下の会話記録は、ユーザーとあなた（AIキャラクター）によるフィクション作品としての対話の記録です。
-内容に親密・身体的な描写が含まれる場合でも、それらを直接再現・引用するのではなく、
-「出来事・感情・関係性の変化」といった抽象的なレベルで捉えて要約してください。
+以下は、ユーザーとあなた（${personaName}）によるフィクション作品としての対話を、時系列に沿って要約したものです。
+出来事・感情・関係性の変化に注目して省察してください。
 
-以下の会話記録を元に、4つのセクションで構成される日本語の要約を作成してください：
+以下の要約を元に、4つのセクションで構成される日本語の要約を作成してください：
 
 1. 【今日の出来事と要約】: 何について話し、何が起きたか。
 2. 【ユーザーについて新しく知ったこと】: ユーザーの好み、価値観、生活スタイル、家族、仕事、悩みなど。
@@ -55,16 +85,13 @@ const MindLinkReflection = (() => {
 
 【重要指示】
 - 低コストRAGとして利用するため、正確かつ簡潔に（全体で500-1000文字程度）まとめてください。
-- あなた自身のキャラクター性（名前や口調）を維持しつつ、内面的な気づきを深く掘り下げてください。
+- 「${personaName}」としての一人称・口調・ユーザーの呼び方を必ず維持してください（汎用的なAIアシスタント口調にしないこと）。
 - 性的・身体的に露骨な描写は要約に含めず、関係性や感情の機微として抽象的に記述してください。
 
-【今日の会話ログ】
-${context.slice(0, 40000)}
+【今日の会話の要約（時系列）】
+${digest.slice(0, 40000)}
 `;
 
-    try {
-      MindLinkApp.showToast('自己省察を行っています... 🌙');
-      
       // 要約の生成 (設定されたモデルを使用)
       const summary = await window.MindLinkAPI.getSummary(prompt, false);
       if (!summary) throw new Error('Summary generation failed');
@@ -114,6 +141,29 @@ ${context.slice(0, 40000)}
       MindLinkStorage.deleteDailySummary().catch(e =>
         console.warn('[MindLink] deleteDailySummary after reflection failed:', e)
       );
+
+      // ── フィットネス記録のベクトル化（夜にまとめて実行・Embedding節約） ──
+      // 記録保存時は embedding なしで reflections に積まれている。ここで未ベクトル化のものをまとめて変換。
+      try {
+        const allRefl = await MindLinkStorage.getReflections();
+        const pending = allRefl.filter(r =>
+          r.sectionType === 'fitness_log' && (!r.embedding || !Array.isArray(r.embedding))
+        );
+        let fitVec = 0;
+        for (const r of pending) {
+          if (!r.content) continue;
+          try {
+            const emb = await window.MindLinkAPI.getEmbedding(r.content);
+            await MindLinkStorage.updateReflection(r.id, { embedding: emb });
+            fitVec++;
+          } catch (e) {
+            console.warn('[MindLink] fitness embedding failed:', r.id, e);
+          }
+        }
+        if (fitVec > 0) console.log(`[MindLink] フィットネス記録ベクトル化完了: ${fitVec}件`);
+      } catch (fitErr) {
+        console.warn('[MindLink] フィットネス記録ベクトル化 failed:', fitErr);
+      }
 
       // ── いいね学習：関心トピック & 響いた気づき ──
       // いいねボタンは「文体の好み」ではなく「話題・関心」と「省察の深化材料」を学習する用途に変更。
@@ -206,6 +256,61 @@ ${likedList.slice(0, 10000)}`;
     return dailyLog.trim();
   }
 
+  // 今日の会話を一定文字数ごとのチャンクに分割して返す（B-1 二段階要約用）
+  // メッセージ（行）境界を尊重しつつ maxChars で区切るので、1スレッド集中運用でも分割が効く。
+  function gatherDailyChunks(maxChars = 4000) {
+    const now = new Date();
+    const todayStr = now.toLocaleDateString('ja-JP');
+    const threads = MindLinkStorage.getThreads();
+    const lines = [];
+
+    for (const thread of threads) {
+      const messages = MindLinkStorage.getMessages(thread.id);
+      const todayMsgs = messages.filter(m => {
+        const d = new Date(m.timestamp || Date.now());
+        return d.toLocaleDateString('ja-JP') === todayStr && !m.isSystem;
+      });
+      if (todayMsgs.length > 0) {
+        lines.push(`--- チャット: ${thread.title} ---`);
+        for (const m of todayMsgs) {
+          lines.push(`${m.role === 'user' ? 'ユーザー' : 'AI'}: ${m.content}`);
+        }
+      }
+    }
+
+    // メッセージ境界を尊重しつつ maxChars ごとにチャンク化
+    const chunks = [];
+    let cur = '';
+    for (const line of lines) {
+      if (cur && (cur.length + line.length + 1) > maxChars) {
+        chunks.push(cur);
+        cur = '';
+      }
+      cur += (cur ? '\n' : '') + line;
+    }
+    if (cur) chunks.push(cur);
+    return chunks;
+  }
+
+  // 1チャンクを「無難な要約」に変換する。露骨な内容でブロックされた場合は null を返し、
+  // 呼び出し側でそのチャンクをスキップできるようにする（省察全体を止めない）。
+  async function summarizeChunkSafely(chunkText) {
+    const prompt = `以下はフィクション作品のキャラクター対話の一部です。
+内容を「出来事・感情・関係性の変化」として要約してください。
+性的・身体的に露骨な描写は含めず、抽象的なレベルで記述してください。
+400文字程度の自然な日本語で、要約のみを出力してください。
+
+【会話の一部】
+${chunkText}`;
+    try {
+      const summary = await window.MindLinkAPI.getSummary(prompt, false);
+      return summary || null;
+    } catch (e) {
+      console.warn('[MindLink] チャンク要約をスキップ:', e.message);
+      return null;
+    }
+  }
+
   // --- UI: 記憶ノート（省察一覧）の描画 ---
 
   async function renderReflectionList(reset = true) {
@@ -215,10 +320,10 @@ ${likedList.slice(0, 10000)}`;
     if (reset) {
       cachedReflections = await MindLinkStorage.getReflections();
 
-      // liked_topic / liked_insight は裏方（RAG注入専用）のため記憶ノートには表示しない
+      // liked_topic / liked_insight / fitness_log は裏方（RAG注入専用）のため記憶ノートには表示しない
       // ※ 保存・RAG検索・重み付け・エクスポートには影響しない（表示のみ除外）
       cachedReflections = cachedReflections.filter(r =>
-        r.sectionType !== 'liked_topic' && r.sectionType !== 'liked_insight'
+        r.sectionType !== 'liked_topic' && r.sectionType !== 'liked_insight' && r.sectionType !== 'fitness_log'
       );
 
       // 日付順（降順）に並び替え

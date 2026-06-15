@@ -339,6 +339,21 @@ const MindLinkAPI = (() => {
           let fullText = '';
           let allParts = [];
           let finishReason = null;
+          // ── アイドルタイムアウト（30秒）用 ──
+          const TIMEOUT_MS = 30000;
+          let timedOut = false;
+          let idleTimer = null;
+          const timeoutController = new AbortController();
+          const resetIdle = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => { timedOut = true; timeoutController.abort(); }, TIMEOUT_MS);
+          };
+          // 外部signal（停止ボタン）が発火したら内部controllerもabortして両立させる
+          const onExternalAbort = () => timeoutController.abort();
+          if (signal) {
+            if (signal.aborted) timeoutController.abort();
+            else signal.addEventListener('abort', onExternalAbort, { once: true });
+          }
           try {
             if (signal?.aborted) return;
 
@@ -522,8 +537,10 @@ const MindLinkAPI = (() => {
                   if (refs.length > 0 || researchThreads.length > 0) {
                     const knowledge = refs.filter(r => ['user_knowledge', 'ai_growth', 'liked_topic', 'liked_insight'].includes(r.sectionType)).slice(0, 4);
                     const episodes  = refs.filter(r => r.sectionType === 'episode' || !r.sectionType).slice(0, 2);
+                    const fitness   = refs.filter(r => r.sectionType === 'fitness_log').slice(0, 3);
                     const ragParts  = [];
                     if (knowledge.length > 0) ragParts.push('【最新のユーザー理解・関心・気づき（新しい情報を優先）】\n' + knowledge.map(r => `* ${r.content}`).join('\n'));
+                    if (fitness.length   > 0) ragParts.push('【最近のフィットネス記録（体重・体脂肪・筋トレ・有酸素など。聞かれたら自然に触れてよい）】\n' + fitness.map(r => `* ${r.content}`).join('\n'));
                     if (episodes.length  > 0) ragParts.push('【過去の思い出・出来事（参考情報）】\n'     + episodes.map(r => `* ${r.content}`).join('\n'));
                     if (researchThreads.length > 0) ragParts.push('【未解決スレッド・継続的関心（過去に気になっていたこと）】\n' + researchThreads.map(r => `* ${r.content}`).join('\n'));
                     if (ragParts.length  > 0) ragPrompt = '\n\n【優先度3：過去の自己省察（※古い情報の可能性があるため参考程度）】\n' + ragParts.join('\n\n');
@@ -567,11 +584,13 @@ const MindLinkAPI = (() => {
 
             // safetySettingsは明示的に設定せず、APIのデフォルト動的判断（文脈考慮）に委ねる
 
+            // 接続自体が固まる場合に備え、fetch開始前にタイマーを始動
+            resetIdle();
             const response = await fetch(url, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(body),
-              signal
+              signal: timeoutController.signal
             });
 
             if (!response.ok) {
@@ -595,6 +614,7 @@ const MindLinkAPI = (() => {
 
             while (true) {
               const { done, value } = await reader.read();
+              resetIdle(); // トークン受信のたびにアイドルタイマーをリセット
 
               if (value) {
                 buffer += decoder.decode(value, { stream: true });
@@ -642,6 +662,8 @@ const MindLinkAPI = (() => {
 
               if (done) break;
             }
+            // ストリーム完了：以降のツール実行中はアイドル監視を止める
+            if (idleTimer) clearTimeout(idleTimer);
 
             // ── ツール呼び出し処理（再帰なし・ループで継続） ──
             const pendingCalls = allParts.filter(p => p.functionCall).map(p => p.functionCall);
@@ -697,9 +719,20 @@ const MindLinkAPI = (() => {
             return onComplete(fullText, webSearchUsed ? ['__web_search__'] : [], actualModel, finishReason);
 
           } catch (e) {
-            if (e.name === 'AbortError') return;
-            console.error(`[MindLink API] Attempt fail (${actualModel}):`, e);
-            lastError = e.message;
+            if (e.name === 'AbortError') {
+              // 停止ボタン（外部signal）による中断 → 従来通り終了
+              if (signal?.aborted) return;
+              // アイドル/接続タイムアウトによる中断 → returnせず次モデルへフォールバック
+              if (timedOut) {
+                console.warn(`[MindLink API] Idle/connection timeout (${TIMEOUT_MS / 1000}s) on ${actualModel} — falling back`);
+                lastError = `応答タイムアウト（${TIMEOUT_MS / 1000}秒）`;
+              } else {
+                return; // 想定外のabortは従来通り終了
+              }
+            } else {
+              console.error(`[MindLink API] Attempt fail (${actualModel}):`, e);
+              lastError = e.message;
+            }
 
             // ツール実行後のエラー：追加済みメッセージをロールバック
             if (allAddedMessageIds.length > 0 && threadId) {
@@ -732,6 +765,10 @@ const MindLinkAPI = (() => {
             if (!isRetriable) {
               break;
             }
+          } finally {
+            // タイマー解除・外部signalリスナー除去（メモリリーク防止）
+            if (idleTimer) clearTimeout(idleTimer);
+            if (signal) signal.removeEventListener('abort', onExternalAbort);
           }
         }
       }

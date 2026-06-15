@@ -13,13 +13,22 @@ const MindLinkThreads = (() => {
   function getCurrentThreadId() { return _currentThreadId; }
   function setCurrentThreadId(id) { _currentThreadId = id; }
 
+  // UIで選択中のモデルを一時保持（スレッド未作成でも選択を覚えておく）
+  // createThread がこの値を使うため、新規チャットでも選択が確実に反映される。
+  function getPendingModel() {
+    return MindLinkStorage.get('pendingModel', 'gemini-3.5-flash');
+  }
+  function setPendingModel(model) {
+    return MindLinkStorage.set('pendingModel', model);
+  }
+
   // スレッド作成
   function createThread(personaId) {
     const thread = {
       id: generateId(),
       title: '新しいチャット',
       personaId: personaId || MindLinkStorage.getActivePersonaId(),
-      model: 'gemini-3.5-flash',
+      model: getPendingModel(),
       isPinned: false,
       isArchived: false,
       createdAt: Date.now(),
@@ -254,6 +263,8 @@ const MindLinkThreads = (() => {
     generateId,
     getCurrentThreadId,
     setCurrentThreadId,
+    getPendingModel,
+    setPendingModel,
     createThread,
     updateThreadTitle,
     togglePin,

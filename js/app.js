@@ -731,6 +731,9 @@ const MindLinkApp = (() => {
       MindLinkThreads.setCurrentThreadId(thread.id);
       MindLinkChat.clearMessages();
       document.getElementById('current-thread-title').textContent = '新しいチャット';
+      // モデルセレクトの表示を新スレッドの実モデル（=保留中の選択）に同期
+      const _ms = document.getElementById('thread-model-select');
+      if (_ms) _ms.value = thread.model;
       MindLinkPersonas.selectPersona(thread.personaId);
       MindLinkThreads.renderThreadList();
       if (window.innerWidth <= 700) closeSidebar();
@@ -843,13 +846,19 @@ const MindLinkApp = (() => {
     });
 
     // ── スレッド内モデル選択 ──
-    document.getElementById('thread-model-select')?.addEventListener('change', (e) => {
-      const threadId = MindLinkThreads.getCurrentThreadId();
-      if (threadId) {
-        MindLinkThreads.updateThreadModel(threadId, e.target.value);
+    const modelSelectEl = document.getElementById('thread-model-select');
+    if (modelSelectEl) {
+      // 起動時：保留中（UIで最後に選んだ）モデルを表示に反映し、実モデルと一致させる
+      modelSelectEl.value = MindLinkThreads.getPendingModel();
+      modelSelectEl.addEventListener('change', (e) => {
+        const model = e.target.value;
+        // スレッド未作成でも選択を保持（createThread時にこの値が使われる）
+        MindLinkThreads.setPendingModel(model);
+        const threadId = MindLinkThreads.getCurrentThreadId();
+        if (threadId) MindLinkThreads.updateThreadModel(threadId, model);
         MindLinkApp.showToast('モデルを更新しました');
-      }
-    });
+      });
+    }
 
     // ── 設定タブ ──
     document.querySelectorAll('.settings-tab').forEach(tab => {
