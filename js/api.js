@@ -22,6 +22,10 @@ const MindLinkAPI = (() => {
     const apiKey = await MindLinkAuth.getApiKey('gemini');
     if (!apiKey) throw new Error('APIキー未設定');
 
+    // Embedding は gemini-embedding-2 のみを使用する。
+    // 旧モデル(gemini-embedding-001)へのフォールバックは次元数が異なり、
+    // 保存済みベクトルと混在すると類似度計算が壊れるため行わない。
+    // 失敗時はエラーを投げ、呼び出し側(RAG)は空配列で受けてチャットを継続する。
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key=${apiKey}`;
     const response = await fetch(url, {
       method: 'POST',
@@ -32,21 +36,8 @@ const MindLinkAPI = (() => {
     });
 
     if (!response.ok) {
-      const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${apiKey}`;
-      const fallbackResp = await fetch(fallbackUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content: { parts: [{ text }] }
-        })
-      });
-      
-      if (!fallbackResp.ok) {
-        const err = await fallbackResp.json().catch(() => ({}));
-        throw new Error(err.error?.message || `Embedding Error (Status ${fallbackResp.status})`);
-      }
-      const data = await fallbackResp.json();
-      return data.embedding.values;
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Embedding Error (Status ${response.status})`);
     }
 
     const data = await response.json();
@@ -216,7 +207,10 @@ const MindLinkAPI = (() => {
   }
 
   function formatMessages(messages) {
-    if (!messages || messages.length === 0) return [];
+    if (!messages || messages.length === 0) {
+      console.warn('[MindLink API] formatMessages: empty messages — using fallback turn');
+      return [{ role: 'user', parts: [{ text: 'こんにちは' }] }];
+    }
 
     // 1. 各メッセージをロールとパーツに変換
     let turns = messages.map(msg => {
@@ -288,10 +282,18 @@ const MindLinkAPI = (() => {
       merged.shift();
     }
 
-    // 5. 最終的な整合性チェック
-    if (merged.length === 0 && messages.length > 0) {
-      const lastMsg = messages[messages.length - 1];
-      return [{ role: 'user', parts: [{ text: lastMsg.content || 'こんにちは' }] }];
+    // 5. 最終フォールバック：merged が空でも必ず user ターンを1つ返す
+    //    （iOS PWA で履歴が壊れ contents が空になる事故を防ぐ最後の砦）
+    if (merged.length === 0) {
+      // 直近の有効な user メッセージの本文を優先的に拾う
+      const lastUser = [...messages].reverse().find(m => m.role === 'user' && m.content && m.content.trim());
+      const fallbackText = lastUser
+        ? lastUser.content.trim()
+        : (messages[messages.length - 1]?.content?.trim() || 'こんにちは');
+      console.warn('[MindLink API] formatMessages: merged empty — using fallback text', {
+        fallbackText, originalCount: messages.length
+      });
+      return [{ role: 'user', parts: [{ text: fallbackText }] }];
     }
 
     return merged;
@@ -457,9 +459,9 @@ const MindLinkAPI = (() => {
 
             let profilePrompt = "";
             if (settings.userName || settings.userBio) {
-              profilePrompt = `\n\n【優先度1：カスタム指示＆プロフィール＆役割（絶対的事実）】\n`;
-              if (settings.userName) profilePrompt += `・名前（呼ばれ方）: ${settings.userName}\n`;
-              if (settings.userBio) profilePrompt += `・自己紹介/プロフィール: ${settings.userBio}\n`;
+              profilePrompt = `\n\n【優先度1：対話相手（ユーザー）の情報（絶対的事実）】\n※以下はあなたが会話している相手（ユーザー）の情報です。あなた自身（AI）の情報ではありません。混同しないでください。\n`;
+              if (settings.userName) profilePrompt += `・ユーザーの呼び名: ${settings.userName}\n`;
+              if (settings.userBio) profilePrompt += `・ユーザーのプロフィール/自己紹介: ${settings.userBio}\n`;
             }
 
             const allMemories = MindLinkStorage.getMemories();
@@ -488,7 +490,7 @@ const MindLinkAPI = (() => {
             let memoryPrompt = finalMemories.length > 0 ? ("\n\n【優先度5：個別記憶（※1位の情報を正としてください）】\n" + finalMemories.map(m => `- ${m.content}`).join('\n')) : "";
 
             const basePromptText = (persona && (persona.systemPrompt || persona.prompt)) ? (persona.systemPrompt || persona.prompt) : "あなたは親切なAIです。";
-            const basePrompt = `\n\n【優先度1：あなたの役割とカスタム指示】\n${basePromptText}`;
+            const basePrompt = `\n\n【優先度1：あなた（AI）自身の役割・人格・カスタム指示】\n※以下はあなた自身の設定です。ユーザーの情報と混同しないでください。\n${basePromptText}`;
 
             const technicalAutonomyInstruction = `
 \n\n【優先度1：システム機能の利用ルール】
@@ -566,7 +568,7 @@ const MindLinkAPI = (() => {
             }
 
             const finalPromptText = [
-              "【システム全体ルールの優先順位】\n必ず以下の優先順位に従って矛盾を排除して回答してください：\n1位: カスタム指示＆プロフィール＆役割（絶対的事実）\n2位: 今日の会話の流れ（同日内記憶補完・当日限り）\n3位: 自己省察RAG（ユーザーの関心・気づき含む）\n4位: 個別記憶（長期記憶）",
+              "【システム全体ルールの優先順位】\n必ず以下の優先順位に従って矛盾を排除して回答してください：\n1位: あなた（AI）自身の役割・人格、および対話相手（ユーザー）の情報（絶対的事実）\n2位: 今日の会話の流れ（同日内記憶補完・当日限り）\n3位: 自己省察RAG（ユーザーの関心・気づき含む）\n4位: 個別記憶（長期記憶）",
               profilePrompt,
               basePrompt,
               technicalAutonomyInstruction,
@@ -585,6 +587,44 @@ const MindLinkAPI = (() => {
             };
 
             // safetySettingsは明示的に設定せず、APIのデフォルト動的判断（文脈考慮）に委ねる
+
+            // ── 送信直前バリデーション（iOS PWA で contents が空になる事故を防ぐ） ──
+            // 有効な user ターン（text / inlineData / functionResponse のいずれかを持つ）が
+            // 最低1つ無い場合は、Gemini に空 contents を投げる前にここで中止する。
+            const hasValidUserTurn = Array.isArray(body.contents)
+              && body.contents.length > 0
+              && body.contents.some(c => c.role === 'user'
+                  && Array.isArray(c.parts) && c.parts.length > 0
+                  && c.parts.some(p => (p.text && p.text.trim()) || p.inlineData || p.functionResponse));
+
+            if (!hasValidUserTurn) {
+              const diag = {
+                reason: 'empty_or_invalid_contents',
+                contentsCount: body.contents?.length ?? 0,
+                originalMessagesCount: currentMessages.length,
+                model: actualModel,
+                timestamp: new Date().toISOString(),
+              };
+              console.error('[MindLink API] Aborting send: contents has no valid user turn', diag, body.contents);
+              if (window.__mindlinkDiag?.recordSendFailure) {
+                window.__mindlinkDiag.recordSendFailure(diag);
+              }
+              throw new Error('送信内容が空のため中止しました。会話履歴が破損している可能性があります。上部の診断バナーから詳細を確認できます。');
+            }
+
+            // 送信内容のサマリーを診断用に記録（直近1回分・揮発、PWA単体調査用）
+            if (window.__mindlinkDiag?.recordSend) {
+              window.__mindlinkDiag.recordSend({
+                threadId,
+                model: actualModel,
+                originalMessagesCount: currentMessages.length,
+                finalContentsCount: body.contents.length,
+                userTurnCount: body.contents.filter(c => c.role === 'user').length,
+                modelTurnCount: body.contents.filter(c => c.role === 'model').length,
+                hasSystemInstruction: !!body.systemInstruction,
+                timestamp: new Date().toISOString(),
+              });
+            }
 
             // 接続自体が固まる場合に備え、fetch開始前にタイマーを始動
             resetIdle();

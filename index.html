@@ -929,6 +929,13 @@
             <p class="setting-hint">現在のPINを確認してから新しいPINを設定します</p>
             <button class="btn-secondary" id="btn-change-pin">PINを変更する</button>
           </div>
+          <div class="setting-group">
+            <label class="setting-label">データ管理</label>
+            <p class="setting-hint">アーカイブしたスレッドをまとめてファイルに書き出し／読み込みします（バックアップ・機種変用）。読み込んだスレッドはアーカイブに入ります。</p>
+            <button class="btn-secondary" id="btn-export-archive">📥 アーカイブを一括エクスポート</button>
+            <button class="btn-secondary" id="btn-import-archive">📤 アーカイブを読み込む</button>
+            <input type="file" id="input-import-archive" accept="application/json,.json" style="display: none;">
+          </div>
           <div class="setting-group danger-zone">
             <label class="setting-label" style="color: var(--color-danger)">危険な操作</label>
             <button class="btn-danger" id="btn-reset-app">全データを削除してリセット</button>
