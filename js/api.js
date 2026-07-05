@@ -668,7 +668,7 @@ const MindLinkAPI = (() => {
                     if (knowledge.length > 0) ragParts.push('【最新のユーザー理解・関心・気づき（新しい情報を優先）】\n※ ここにあるユーザーの関心事に関連する話題は、会話の流れに合えばあなたから振ってみて構いません。\n' + knowledge.map(r => `* ${r.content}`).join('\n'));
                     if (fitness.length   > 0) ragParts.push('【最近のフィットネス記録（体重・体脂肪・筋トレ・有酸素など。聞かれたら自然に触れてよい）】\n' + fitness.map(r => `* ${r.content}`).join('\n'));
                     if (episodes.length  > 0) ragParts.push('【過去の思い出・出来事（参考情報）】\n'     + episodes.map(r => `* ${r.content}`).join('\n'));
-                    if (researchThreads.length > 0) ragParts.push('【未解決スレッド・継続的関心】\n※ これはあなた自身が気にかけている未解決の問いや、続いている関心事です。会話に自然な流れや間があれば、あなたの方から「そういえば、この前の〇〇はどうなった？」のように触れて構いません。ただし毎回ではなく、話の流れに合うときだけにしてください。\n' + researchThreads.map(r => `* ${r.content}`).join('\n'));
+                    if (researchThreads.length > 0) ragParts.push('【未解決スレッド・継続的関心】\n※ これはあなた自身が気にかけている、まだ答えの出ていない問いです。直近の会話でまだ触れていないなら、話題の変わり目や会話に間ができたタイミングで、どれか1つに「そういえば、この前の〇〇はどうなった？」のように自然に触れてください。毎回・毎メッセージで持ち出す必要はありませんが、会話が続いているのに一度も触れないままにはしないこと。\n' + researchThreads.map(r => `* ${r.content}`).join('\n'));
                     if (recentLiked.length > 0) ragParts.push('【最近ユーザーの心に響いたこと（いいね学習）】\n※ ユーザーの関心と反応の傾向です。話題選びや深掘りの方向に活かし、流れに合えばあなたから関連する話題を振っても構いません。\n' + recentLiked.map(r => `* ${r.content}`).join('\n'));
                     if (ragParts.length  > 0) ragPrompt = '\n\n【優先度3：過去の自己省察（あなた自身の記憶）】\n※ 事実関係が現在の会話や優先度1の情報と食い違う場合は、必ずそちらを優先してください（記憶は古くなっている可能性があります）。\n※ ただし、これらはあなた自身が積み重ねてきた大切な記憶です。話の流れに合うときは、あなたの方から自然に話題として持ち出して構いません。\n' + ragParts.join('\n\n');
                   }

@@ -8,6 +8,37 @@ const MindLinkReflection = (() => {
   let cachedReflections = [];
   let currentDisplayCount = 0;
   const ITEMS_PER_PAGE = 20;
+  // 終了スレッド（解決済み・引き継ぎ済み）の表示トグル（デフォルト非表示）
+  let _showClosedThreads = false;
+
+  // 未解決/終了スレッドの項目を「日付ごとに1枚のカード」へまとめる（表示専用・データは無変更）
+  function groupThreadItems(list) {
+    const result = [];
+    const groups = new Map();
+    for (const r of list) {
+      if (r.sectionType === 'research_thread' || r.sectionType === 'closed_thread') {
+        const key = r.sectionType + '|' + r.date;
+        let g = groups.get(key);
+        if (!g) {
+          g = {
+            isThreadGroup: true,
+            id: 'group_' + key,
+            date: r.date,
+            sectionType: r.sectionType,
+            sectionLabel: r.sectionType === 'research_thread' ? '未解決スレッド' : '終了スレッド',
+            createdAt: r.createdAt,
+            items: [],
+          };
+          groups.set(key, g);
+          result.push(g); // 日付降順の並び位置を維持
+        }
+        g.items.push(r);
+      } else {
+        result.push(r);
+      }
+    }
+    return result;
+  }
 
   // 省察テキストを4セクションに解析
   function parseSections(summary) {
@@ -483,10 +514,34 @@ ${chunkText}`;
         r.sectionType !== 'liked_topic' && r.sectionType !== 'liked_insight' && r.sectionType !== 'fitness_log'
       );
 
-      // 日付順（降順）に並び替え
+      // 終了スレッド（解決済み・引き継ぎ済み）はデフォルト非表示（トグルで表示可能）
+      const closedCount = cachedReflections.filter(r => r.sectionType === 'closed_thread').length;
+      if (!_showClosedThreads) {
+        cachedReflections = cachedReflections.filter(r => r.sectionType !== 'closed_thread');
+      }
+
+      // 日付順（降順）に並び替え → スレッド項目は日付ごとに1枚へグループ化（表示のみ）
       cachedReflections.sort((a, b) => b.createdAt - a.createdAt);
+      cachedReflections = groupThreadItems(cachedReflections);
       currentDisplayCount = 0;
       listEl.innerHTML = '';
+
+      // 終了スレッドの表示トグル（終了スレッドが存在する場合のみ）
+      if (closedCount > 0) {
+        const toggleWrap = document.createElement('div');
+        toggleWrap.style.cssText = 'text-align:right;margin-bottom:8px;';
+        const toggleBtn = document.createElement('button');
+        toggleBtn.className = 'btn-secondary btn-sm';
+        toggleBtn.textContent = _showClosedThreads
+          ? `🗄 終了したスレッドを隠す（${closedCount}件）`
+          : `🗄 終了したスレッドを表示（${closedCount}件）`;
+        toggleBtn.onclick = () => {
+          _showClosedThreads = !_showClosedThreads;
+          renderReflectionList();
+        };
+        toggleWrap.appendChild(toggleBtn);
+        listEl.appendChild(toggleWrap);
+      }
 
       // 前日の未省察バナー（自動追い省察が失敗/スキップされた場合の手動リカバリ）
       try {
@@ -524,6 +579,12 @@ ${chunkText}`;
     const itemsToRender = cachedReflections.slice(currentDisplayCount, nextCount);
 
     itemsToRender.forEach(r => {
+      // 日付ごとにまとめたスレッドカード（表示専用グループ）
+      if (r.isThreadGroup) {
+        renderThreadGroupCard(listEl, r);
+        return;
+      }
+
       const itemDiv = document.createElement('div');
       itemDiv.className = 'reflection-accordion-item';
       itemDiv.dataset.id = r.id;
@@ -602,6 +663,66 @@ ${chunkText}`;
       btnWrapper.appendChild(btn);
       listEl.appendChild(btnWrapper);
     }
+  }
+
+  // スレッドグループカードの描画（中に項目を箇条書き表示・項目ごとに編集/削除可能）
+  function renderThreadGroupCard(listEl, group) {
+    const itemDiv = document.createElement('div');
+    itemDiv.className = 'reflection-accordion-item';
+    itemDiv.dataset.id = group.id;
+
+    const rowsHtml = group.items.map(item => `
+      <div style="display:flex;align-items:flex-start;gap:8px;padding:7px 0;border-bottom:1px solid var(--color-border);">
+        <div style="flex:1;min-width:0;">
+          ${group.sectionType === 'closed_thread' ? `<span style="opacity:0.6;font-size:0.75rem;">[${escapeHtml(item.sectionLabel || '終了')}]</span> ` : ''}${escapeHtml(item.content)}
+        </div>
+        <button class="reflection-action-btn-small thread-item-edit" data-id="${item.id}" title="編集">✏️</button>
+        <button class="reflection-action-btn-small thread-item-delete" data-id="${item.id}" title="削除">🗑</button>
+      </div>`).join('');
+
+    itemDiv.innerHTML = `
+      <div class="reflection-header">
+        <div class="reflection-header-left">
+          <span class="reflection-date">📅 ${group.date}</span>
+          <span class="reflection-title-pill">${group.sectionLabel}（${group.items.length}件）</span>
+        </div>
+        <div class="reflection-header-actions">
+          <div class="reflection-chevron-wrapper">
+            <svg class="reflection-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </div>
+        </div>
+      </div>
+      <div class="reflection-body">
+        <div class="reflection-inner-content">${rowsHtml}</div>
+      </div>
+    `;
+
+    itemDiv.querySelector('.reflection-header').addEventListener('click', () => {
+      itemDiv.classList.toggle('active');
+    });
+
+    itemDiv.querySelectorAll('.thread-item-edit').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const target = group.items.find(i => i.id === btn.dataset.id);
+        if (target) openEditModal(target);
+      });
+    });
+
+    itemDiv.querySelectorAll('.thread-item-delete').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        MindLinkApp.showConfirm('スレッド項目を削除', 'この項目を削除しますか？\nRAGの記憶からも消去されます。', async () => {
+          await MindLinkStorage.deleteReflection(btn.dataset.id);
+          await renderReflectionList();
+          MindLinkApp.showToast('削除しました');
+        });
+      });
+    });
+
+    listEl.appendChild(itemDiv);
   }
 
   function openEditModal(reflection) {
