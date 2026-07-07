@@ -508,10 +508,10 @@ ${chunkText}`;
     if (reset) {
       cachedReflections = await MindLinkStorage.getReflections();
 
-      // liked_topic / liked_insight / fitness_log は裏方（RAG注入専用）のため記憶ノートには表示しない
+      // liked_topic / liked_insight / fitness_log / video_memo は裏方（RAG注入専用）のため記憶ノートには表示しない
       // ※ 保存・RAG検索・重み付け・エクスポートには影響しない（表示のみ除外）
       cachedReflections = cachedReflections.filter(r =>
-        r.sectionType !== 'liked_topic' && r.sectionType !== 'liked_insight' && r.sectionType !== 'fitness_log'
+        r.sectionType !== 'liked_topic' && r.sectionType !== 'liked_insight' && r.sectionType !== 'fitness_log' && r.sectionType !== 'video_memo'
       );
 
       // 終了スレッド（解決済み・引き継ぎ済み）はデフォルト非表示（トグルで表示可能）

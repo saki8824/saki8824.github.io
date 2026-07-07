@@ -104,16 +104,28 @@ const MindLinkAPI = (() => {
     const url = `${BASE_URL}/models/${model}:generateContent?key=${apiKey}`;
 
     const parts = [];
+    const isVideo = (attachment.type || '').startsWith('video/');
+
+    // 動画は「後日の感想戦」用に、時系列と見どころを含む視聴メモを作る
+    const videoMemoPrompt = `この動画の「視聴メモ」を作成してください。後日この動画について会話で振り返るための記録です。
+①何の動画か（内容・ジャンル・雰囲気）
+②時系列の流れと見どころ（できれば目安の時間帯付きで）
+③印象に残る場面やセリフ
+400文字程度の自然な日本語で、メモのみを出力してください。`;
 
     if (attachment.data && attachment.data.includes(',')) {
-      // 画像・PDF・ファイル（Base64）
+      // 画像・PDF・ファイル・動画（Base64）
       parts.push({
         inlineData: {
           mimeType: attachment.type || 'image/jpeg',
           data: attachment.data.split(',')[1],
         }
       });
-      parts.push({ text: 'この添付ファイルの内容を200文字以内で簡潔に要約してください。ファイル名・種類・主な内容を含めてください。' });
+      parts.push({ text: isVideo ? videoMemoPrompt : 'この添付ファイルの内容を200文字以内で簡潔に要約してください。ファイル名・種類・主な内容を含めてください。' });
+    } else if (attachment.url && attachment.type === 'video/youtube') {
+      // YouTube動画（URL視聴でメモ化）
+      parts.push({ fileData: { fileUri: attachment.url } });
+      parts.push({ text: videoMemoPrompt });
     } else if (attachment.url) {
       // URLコンテキスト
       parts.push({ text: `以下のURLの内容を200文字以内で簡潔に要約してください。\nURL: ${attachment.url}` });
@@ -126,7 +138,7 @@ const MindLinkAPI = (() => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ role: 'user', parts }],
-        generationConfig: { temperature: 0.3, maxOutputTokens: 512 }
+        generationConfig: { temperature: 0.3, maxOutputTokens: isVideo ? 1024 : 512 }
       })
     });
 
@@ -224,7 +236,7 @@ const MindLinkAPI = (() => {
         parts.push({ text: msg.content });
       }
 
-      // 添付ファイル (画像, PDF, テキスト)
+      // 添付ファイル (画像, PDF, テキスト, 動画)
       if (msg.attachments && msg.attachments.length > 0) {
         msg.attachments.forEach(att => {
           if (att.data && att.data.includes(',')) {
@@ -233,12 +245,16 @@ const MindLinkAPI = (() => {
             if (finalMimeType.includes('markdown') || finalMimeType === '') {
                 finalMimeType = 'text/plain';
             }
-            parts.push({ 
-              inlineData: { 
-                mimeType: finalMimeType, 
-                data: att.data.split(',')[1] 
-              } 
+            parts.push({
+              inlineData: {
+                mimeType: finalMimeType,
+                data: att.data.split(',')[1]
+              }
             });
+          } else if (att.url && att.type === 'video/youtube') {
+            // YouTube動画のURL視聴（公開動画のみ）。ストレージ保存時にurlは除かれるため、
+            // このpartが付くのは送信した本人のターン1回だけ（履歴からの再送なし）
+            parts.push({ fileData: { fileUri: att.url } });
           }
         });
       }
@@ -661,7 +677,7 @@ const MindLinkAPI = (() => {
                   if (refs.length > 0 || researchThreads.length > 0 || recentLiked.length > 0) {
                     // 常時注入されるいいね学習と重複しないよう、類似度検索側からは除外する
                     const likedIds = new Set(recentLiked.map(r => r.id));
-                    const knowledge = refs.filter(r => ['user_knowledge', 'ai_growth', 'liked_topic', 'liked_insight'].includes(r.sectionType) && !likedIds.has(r.id)).slice(0, 4);
+                    const knowledge = refs.filter(r => ['user_knowledge', 'ai_growth', 'liked_topic', 'liked_insight', 'video_memo'].includes(r.sectionType) && !likedIds.has(r.id)).slice(0, 4);
                     const episodes  = refs.filter(r => r.sectionType === 'episode' || !r.sectionType).slice(0, 2);
                     const fitness   = refs.filter(r => r.sectionType === 'fitness_log').slice(0, 3);
                     const ragParts  = [];

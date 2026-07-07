@@ -191,7 +191,13 @@ const MindLinkChat = (() => {
     let attachmentsHtml = '';
     if (msg.attachments && msg.attachments.length > 0) {
       msg.attachments.forEach(att => {
-        if (att.type === 'generated-image') {
+        if (att.type === 'video/youtube') {
+          // YouTube視聴用の疑似添付はチップ表示のみ（URL本文はメッセージに含まれている）
+          attachmentsHtml += `
+            <div class="message-attachment">
+              <span class="message-attachment-file">🎬 YouTube動画を一緒に視聴</span>
+            </div>`;
+        } else if (att.type === 'generated-image') {
           // 生成画像: 本体はIndexedDBにあるため、まずスロットを描画して非同期で読み込む
           attachmentsHtml += `
             <div class="message-attachment generated-image-slot" data-image-id="${escapeHtml(att.imageId || '')}">
@@ -518,12 +524,24 @@ const MindLinkChat = (() => {
       _editingMessageId = null;
     }
 
+    // YouTube URLの検出 → 視聴用の疑似添付として追加（動画として処理されるのはこの送信1回だけ。
+    // ストレージ保存時にURLは添付から除かれるため、以降の履歴で動画が再送されることはない）
+    const videoAttachments = [..._attachedFiles];
+    const ytMatch = content.match(/https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?[^\s]*v=|shorts\/)|youtu\.be\/)[\w-]{5,}[^\s]*/);
+    if (ytMatch && !videoAttachments.some(f => f.type && f.type.startsWith('video/'))) {
+      videoAttachments.push({
+        name: 'YouTube動画',
+        type: 'video/youtube',
+        url: ytMatch[0],
+      });
+    }
+
     // ユーザーメッセージ（メモリ上のフルデータ：画像base64を含む）
     const userMsg = {
       id: 'msg_' + Date.now(),
       role: 'user',
       content,
-      attachments: [..._attachedFiles],
+      attachments: videoAttachments,
       timestamp: Date.now(),
     };
 
@@ -638,8 +656,33 @@ const MindLinkChat = (() => {
                 if (!att.data && !att.url) continue;
                 const summary = await window.MindLinkAPI.summarizeAttachment(att);
                 if (summary) {
-                  const label = att.name ? `📎 ${att.name}` : att.url ? `🔗 ${att.url}` : '📎 添付ファイル';
+                  const label = att.type === 'video/youtube'
+                    ? `🎬 YouTube動画（${att.url}）`
+                    : att.type && att.type.startsWith('video/')
+                    ? `🎬 ${att.name || '動画'}`
+                    : att.name ? `📎 ${att.name}` : att.url ? `🔗 ${att.url}` : '📎 添付ファイル';
                   summaryLines.push(`${label}\n${summary}`);
+
+                  // 動画の視聴メモはRAGにも保存（後日「この前の動画さ…」で思い出せるように）
+                  if (att.type && att.type.startsWith('video/')) {
+                    try {
+                      const memoContent = `（一緒に見た動画の記憶）${summary}`;
+                      const emb = await window.MindLinkAPI.getEmbedding(memoContent);
+                      await MindLinkStorage.saveReflection({
+                        id:           'video_' + Date.now(),
+                        content:      memoContent,
+                        embedding:    emb,
+                        sectionType:  'video_memo',
+                        sectionLabel: '動画メモ',
+                        createdAt:    Date.now(),
+                        date:         new Date().toLocaleDateString('ja-JP'),
+                        type:         'video_memo',
+                      });
+                      console.log('[MindLink] 動画メモをRAGに保存しました');
+                    } catch (memoErr) {
+                      console.warn('[MindLink] 動画メモのRAG保存に失敗（履歴上の要約は保存済み）:', memoErr);
+                    }
+                  }
                 }
               }
               if (summaryLines.length > 0) {
@@ -753,14 +796,29 @@ const MindLinkChat = (() => {
     }
   }
 
+  // 動画のサイズ上限: APIリクエスト全体の20MB制限に対し、base64膨張（約4/3倍）と
+  // プロンプト分の余裕を見て12MBまでとする
+  const MAX_VIDEO_BYTES = 12 * 1024 * 1024;
+
   async function handleFileSelect(e) {
     const files = Array.from(e.target.files);
     for (const file of files) {
       if (_attachedFiles.length >= 5) break; // 最大5件
+      if (file.type && file.type.startsWith('video/')) {
+        if (file.size > MAX_VIDEO_BYTES) {
+          MindLinkApp.showToast('動画が大きすぎます（12MBまで）。iPhoneの写真編集でトリミングしてから添付してください 🎬');
+          continue;
+        }
+        if (_attachedFiles.some(f => f.type && f.type.startsWith('video/'))) {
+          MindLinkApp.showToast('動画は1メッセージにつき1本まで添付できます');
+          continue;
+        }
+      }
       const base64 = await fileToBase64(file);
       _attachedFiles.push({
         name: file.name,
         type: file.type,
+        size: file.size,
         data: base64
       });
     }
@@ -787,6 +845,8 @@ const MindLinkChat = (() => {
       item.className = 'file-preview-item';
       if (file.type.startsWith('image/')) {
         item.style.backgroundImage = `url(${file.data})`;
+      } else if (file.type.startsWith('video/')) {
+        item.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:24px;">🎬</div>';
       } else {
         item.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:24px;">📄</div>';
       }
