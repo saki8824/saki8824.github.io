@@ -12,7 +12,9 @@ const MindLinkAPI = (() => {
       const thread = MindLinkStorage.getThread(threadId);
       if (thread && thread.model) return thread.model;
     }
-    return 'gemini-2.5-flash';
+    // モデル未設定スレッドのフォールバック。2.5系は関数ツール（画像生成・カレンダー等）が
+    // 使えないため、最安定・最安価のツール対応3系モデルに落とす。
+    return 'gemini-3.1-flash-lite';
   }
 
   /**
@@ -22,6 +24,10 @@ const MindLinkAPI = (() => {
     const apiKey = await MindLinkAuth.getApiKey('gemini');
     if (!apiKey) throw new Error('APIキー未設定');
 
+    // Embedding は gemini-embedding-2 のみを使用する。
+    // 旧モデル(gemini-embedding-001)へのフォールバックは次元数が異なり、
+    // 保存済みベクトルと混在すると類似度計算が壊れるため行わない。
+    // 失敗時はエラーを投げ、呼び出し側(RAG)は空配列で受けてチャットを継続する。
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key=${apiKey}`;
     const response = await fetch(url, {
       method: 'POST',
@@ -32,21 +38,8 @@ const MindLinkAPI = (() => {
     });
 
     if (!response.ok) {
-      const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${apiKey}`;
-      const fallbackResp = await fetch(fallbackUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content: { parts: [{ text }] }
-        })
-      });
-      
-      if (!fallbackResp.ok) {
-        const err = await fallbackResp.json().catch(() => ({}));
-        throw new Error(err.error?.message || `Embedding Error (Status ${fallbackResp.status})`);
-      }
-      const data = await fallbackResp.json();
-      return data.embedding.values;
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Embedding Error (Status ${response.status})`);
     }
 
     const data = await response.json();
@@ -56,12 +49,13 @@ const MindLinkAPI = (() => {
   /**
    * 要約・省察の生成
    */
-  async function getSummary(prompt, usePro = false) {
+  async function getSummary(prompt) {
     const apiKey = await MindLinkAuth.getApiKey('gemini');
     if (!apiKey) throw new Error('APIキー未設定');
 
+    // 常に設定画面の「自己省察の要約モデル」を使用する（旧usePro引数は紛らわしいため廃止）
     const settings = MindLinkStorage.getSettings();
-    const model = usePro ? 'gemini-3.1-flash-lite' : (settings.summaryModel || 'gemini-2.5-flash');
+    const model = settings.summaryModel || 'gemini-3.1-flash-lite';
     const url = `${BASE_URL}/models/${model}:generateContent?key=${apiKey}`;
 
     const response = await fetch(url, {
@@ -110,16 +104,28 @@ const MindLinkAPI = (() => {
     const url = `${BASE_URL}/models/${model}:generateContent?key=${apiKey}`;
 
     const parts = [];
+    const isVideo = (attachment.type || '').startsWith('video/');
+
+    // 動画は「後日の感想戦」用に、時系列と見どころを含む視聴メモを作る
+    const videoMemoPrompt = `この動画の「視聴メモ」を作成してください。後日この動画について会話で振り返るための記録です。
+①何の動画か（内容・ジャンル・雰囲気）
+②時系列の流れと見どころ（できれば目安の時間帯付きで）
+③印象に残る場面やセリフ
+400文字程度の自然な日本語で、メモのみを出力してください。`;
 
     if (attachment.data && attachment.data.includes(',')) {
-      // 画像・PDF・ファイル（Base64）
+      // 画像・PDF・ファイル・動画（Base64）
       parts.push({
         inlineData: {
           mimeType: attachment.type || 'image/jpeg',
           data: attachment.data.split(',')[1],
         }
       });
-      parts.push({ text: 'この添付ファイルの内容を200文字以内で簡潔に要約してください。ファイル名・種類・主な内容を含めてください。' });
+      parts.push({ text: isVideo ? videoMemoPrompt : 'この添付ファイルの内容を200文字以内で簡潔に要約してください。ファイル名・種類・主な内容を含めてください。' });
+    } else if (attachment.url && attachment.type === 'video/youtube') {
+      // YouTube動画（URL視聴でメモ化）
+      parts.push({ fileData: { fileUri: attachment.url } });
+      parts.push({ text: videoMemoPrompt });
     } else if (attachment.url) {
       // URLコンテキスト
       parts.push({ text: `以下のURLの内容を200文字以内で簡潔に要約してください。\nURL: ${attachment.url}` });
@@ -132,7 +138,7 @@ const MindLinkAPI = (() => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ role: 'user', parts }],
-        generationConfig: { temperature: 0.3, maxOutputTokens: 512 }
+        generationConfig: { temperature: 0.3, maxOutputTokens: isVideo ? 1024 : 512 }
       })
     });
 
@@ -216,7 +222,10 @@ const MindLinkAPI = (() => {
   }
 
   function formatMessages(messages) {
-    if (!messages || messages.length === 0) return [];
+    if (!messages || messages.length === 0) {
+      console.warn('[MindLink API] formatMessages: empty messages — using fallback turn');
+      return [{ role: 'user', parts: [{ text: 'こんにちは' }] }];
+    }
 
     // 1. 各メッセージをロールとパーツに変換
     let turns = messages.map(msg => {
@@ -227,7 +236,7 @@ const MindLinkAPI = (() => {
         parts.push({ text: msg.content });
       }
 
-      // 添付ファイル (画像, PDF, テキスト)
+      // 添付ファイル (画像, PDF, テキスト, 動画)
       if (msg.attachments && msg.attachments.length > 0) {
         msg.attachments.forEach(att => {
           if (att.data && att.data.includes(',')) {
@@ -236,12 +245,16 @@ const MindLinkAPI = (() => {
             if (finalMimeType.includes('markdown') || finalMimeType === '') {
                 finalMimeType = 'text/plain';
             }
-            parts.push({ 
-              inlineData: { 
-                mimeType: finalMimeType, 
-                data: att.data.split(',')[1] 
-              } 
+            parts.push({
+              inlineData: {
+                mimeType: finalMimeType,
+                data: att.data.split(',')[1]
+              }
             });
+          } else if (att.url && att.type === 'video/youtube') {
+            // YouTube動画のURL視聴（公開動画のみ）。ストレージ保存時にurlは除かれるため、
+            // このpartが付くのは送信した本人のターン1回だけ（履歴からの再送なし）
+            parts.push({ fileData: { fileUri: att.url } });
           }
         });
       }
@@ -288,10 +301,18 @@ const MindLinkAPI = (() => {
       merged.shift();
     }
 
-    // 5. 最終的な整合性チェック
-    if (merged.length === 0 && messages.length > 0) {
-      const lastMsg = messages[messages.length - 1];
-      return [{ role: 'user', parts: [{ text: lastMsg.content || 'こんにちは' }] }];
+    // 5. 最終フォールバック：merged が空でも必ず user ターンを1つ返す
+    //    （iOS PWA で履歴が壊れ contents が空になる事故を防ぐ最後の砦）
+    if (merged.length === 0) {
+      // 直近の有効な user メッセージの本文を優先的に拾う
+      const lastUser = [...messages].reverse().find(m => m.role === 'user' && m.content && m.content.trim());
+      const fallbackText = lastUser
+        ? lastUser.content.trim()
+        : (messages[messages.length - 1]?.content?.trim() || 'こんにちは');
+      console.warn('[MindLink API] formatMessages: merged empty — using fallback text', {
+        fallbackText, originalCount: messages.length
+      });
+      return [{ role: 'user', parts: [{ text: fallbackText }] }];
     }
 
     return merged;
@@ -313,12 +334,31 @@ const MindLinkAPI = (() => {
       ? `\n\n【優先度3：今日の会話の流れ（同日内の記憶補完）】\n※ コンテキストウィンドウを超えた本日の会話要約です。現在の会話を優先しつつ、今日の文脈理解の参考にしてください。\n${_dailySummary}`
       : '';
 
+    // 当日の「いいね」即時反映（ループ外で1回のみ・API追加コストなし）
+    // いいねされた返答の冒頭をそのまま注入する。バッファは夜の省察後に空になるため、
+    // いいねを押した日だけ自動的に有効になる。
+    let likedTodayPrompt = '';
+    try {
+      const _likedMsgs = await MindLinkStorage.getLikedMessages();
+      if (_likedMsgs && _likedMsgs.length > 0) {
+        const excerpts = _likedMsgs
+          .sort((a, b) => (b.likeCount || 0) - (a.likeCount || 0))
+          .slice(0, 2)
+          .map(m => `* ${String(m.content || '').replace(/\s+/g, ' ').slice(0, 100)}…`);
+        likedTodayPrompt = `\n\n【最近ユーザーが「いいね」した返答（抜粋）】\n※これらの返答はユーザーの心に強く響きました。何が良かったのか（話題・深さ・距離感・温度）を自分で考え、以降の会話に活かしてください。\n${excerpts.join('\n')}`;
+      }
+    } catch (likedErr) {
+      /* 取得失敗時は注入なしで継続 */
+    }
+
     // フォールバック用のモデルチェーン
+    // url_context（URL読み取り）を維持するため、対応モデル（3系）のみに限定。
+    // ・2.5系は url_context 非対応のため除外（URLを読めず誤動作する）
+    // ・3.1-pro は高コストのため自動フォールバックには含めない
+    // → 安価で安定した gemini-3.1-flash-lite を唯一の落ち先にする
     const fallbackChain = [
       requestedModel,
-      'gemini-3.1-flash-lite',
-      'gemini-2.5-flash',
-      'gemini-2.5-flash-lite'
+      'gemini-3.1-flash-lite'
     ];
 
     // ツールループ用：現在のメッセージ列・追加済みIDを管理
@@ -326,6 +366,55 @@ const MindLinkAPI = (() => {
     const allAddedMessageIds = [];
     let lastError = null;
     let webSearchUsed = false; // Web検索（custom_search / googleSearch Grounding）使用フラグ
+
+    // ── 画像生成の強制トリガー判定 ──
+    // 最後のユーザー発言に「画像生成」が含まれる場合、このリクエストに限り generate_image の
+    // 呼び出しを強制する（mode: ANY）。会話モデルの賢さに依存せず確実にツールを呼ばせるため。
+    // ・自律発話（System Note経由）では発動しない（AIの自発生成禁止の原則）
+    // ・生成実行後はフラグを消費して通常モード（AUTO）に戻る
+    let forceImageCall = false;
+    let forceImageEdit = false;   // 編集の言い回しと判定した場合、edit_last をシステム側で強制する
+    let explicitNewImage = false; // 「画像生成」の明示ワード（＝新規生成の意思表示）
+    let imageEditContext = false; // 直近10メッセージ以内に生成画像があるか（編集デフォルト判定用）
+    if (window.MindLinkImageGen) {
+      const _lastMsg = messages[messages.length - 1];
+      const _isAutonomousSend = !!(_lastMsg && (
+        _lastMsg.isSystem ||
+        (typeof _lastMsg.content === 'string' && _lastMsg.content.includes('(System Note:'))
+      ));
+      // 直近に生成画像があるか（編集デフォルトの文脈判定・自律発話でも参照するため常に計算）
+      if (threadId) {
+        try {
+          const _recentMsgs = MindLinkStorage.getMessages(threadId).slice(-10);
+          imageEditContext = _recentMsgs.some(m =>
+            (m.attachments || []).some(a => a.type === 'generated-image')
+          );
+        } catch (ctxErr) { /* 判定失敗時は新規扱いで継続 */ }
+      }
+      if (!_isAutonomousSend) {
+        const _lastUserMsg = [...messages].reverse().find(m => m.role === 'user' && !m.isSystem && m.content);
+        const _userText = _lastUserMsg ? String(_lastUserMsg.content).split('(System Note:')[0] : '';
+        // 第1段（常時有効）: 「画像生成」の明示ワードのみ。普段の会話ではこれ以外で発動しない
+        if (/画像(を)?生成/.test(_userText)) {
+          forceImageCall = true;
+          explicitNewImage = true; // 明示ワードは「新規生成」の意思表示として扱う
+        }
+        // 第2段（条件付き）: 直近に生成画像がある場合のみ、編集系の言い回しを受け付ける
+        // （編集対象が目の前にあるときだけ有効化することで、通常の雑談での誤発動を防ぐ）
+        if (!forceImageCall && imageEditContext) {
+          if (/再生成|もう一(度|回)生成/.test(_userText)) {
+            // 再生成＝「別のテイクをもう一回」なので新規扱い（編集にするとほぼ同じ絵が返るため）
+            forceImageCall = true;
+            explicitNewImage = true;
+          } else if (/(その|この|さっき|今の|前の)[^。！？\n]{0,10}(画像|絵|写真|イラスト)/.test(_userText)
+              && /生成|作り直|描き直/.test(_userText)) {
+            // 指示語＋画像の編集依頼 → ツール呼び出しと edit_last の両方を強制
+            forceImageCall = true;
+            forceImageEdit = true;
+          }
+        }
+      }
+    }
 
     // ツール呼び出しが発生するたびにループを継続する
     toolLoop: while (true) {
@@ -339,6 +428,21 @@ const MindLinkAPI = (() => {
           let fullText = '';
           let allParts = [];
           let finishReason = null;
+          // ── アイドルタイムアウト（30秒）用 ──
+          const TIMEOUT_MS = 90000; // url_context（URL読み取り）は初動が遅いため余裕を持たせる
+          let timedOut = false;
+          let idleTimer = null;
+          const timeoutController = new AbortController();
+          const resetIdle = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => { timedOut = true; timeoutController.abort(); }, TIMEOUT_MS);
+          };
+          // 外部signal（停止ボタン）が発火したら内部controllerもabortして両立させる
+          const onExternalAbort = () => timeoutController.abort();
+          if (signal) {
+            if (signal.aborted) timeoutController.abort();
+            else signal.addEventListener('abort', onExternalAbort, { once: true });
+          }
           try {
             if (signal?.aborted) return;
 
@@ -355,24 +459,37 @@ const MindLinkAPI = (() => {
             const isGemini2_5 = actualModel.includes('gemini-2.5');
             const tools = [];
             let hasFunctionDeclarations = false;
+            let canForceImage = false;
             // グラウンディング（googleSearch）は全モデルで付与（gemini-2.5系も公式にサポート）
-            tools.push({ googleSearch: {} });
+            // ※画像生成の強制時のみ除外（強制モードと検索系ツールの同時指定はAPIが拒否する可能性があるため）
+            if (!forceImageCall) tools.push({ googleSearch: {} });
             // url_context は gemini-2.5系では googleSearch と同時付与できない（公式制約）ため除外。
             // function_declarations（custom_search等の関数ツール）も tool context circulation
             // 非対応の gemini-2.5系では引き続き除外する。
             if (!isGemini2_5) {
-              tools.push({ url_context: {} });
+              if (!forceImageCall) tools.push({ url_context: {} });
+              let declarations = [];
               if (window.MindLinkGoogleServices) {
                 const cx = settings.searchEngineId;
                 // cx 未設定時は custom_search を除外（モデルが呼ぼうとして失敗するのを防ぐ）
-                const declarations = cx
+                declarations = cx
                   ? window.MindLinkGoogleServices.TOOL_DECLARATIONS
                   : window.MindLinkGoogleServices.TOOL_DECLARATIONS.filter(t => t.name !== 'custom_search');
-                if (declarations.length > 0) {
-                  tools.push({ function_declarations: declarations });
-                  hasFunctionDeclarations = true;
+              }
+              // 画像生成ツール（参照画像の名前一覧を動的に含むため毎回取得・APIコストなし）
+              if (window.MindLinkImageGen) {
+                try {
+                  declarations = [...declarations, await window.MindLinkImageGen.getToolDeclaration()];
+                } catch (imgToolErr) {
+                  console.warn('[MindLink] 画像生成ツール定義の取得に失敗:', imgToolErr);
                 }
               }
+              if (declarations.length > 0) {
+                tools.push({ function_declarations: declarations });
+                hasFunctionDeclarations = true;
+              }
+              // 強制はgenerate_imageの定義が実際に含まれている場合のみ有効化
+              canForceImage = forceImageCall && declarations.some(d => d.name === 'generate_image');
             }
 
             const nowJST = new Date();
@@ -429,8 +546,11 @@ const MindLinkAPI = (() => {
                 toolConfig.include_server_side_tool_invocations = true;
               }
               // function_calling_config は関数ツール（function_declarations）を付与した時のみ設定
+              // 画像生成の強制時は mode: ANY で generate_image の呼び出しを強制する
               if (hasFunctionDeclarations) {
-                toolConfig.function_calling_config = { mode: "AUTO" };
+                toolConfig.function_calling_config = canForceImage
+                  ? { mode: "ANY", allowed_function_names: ["generate_image"] }
+                  : { mode: "AUTO" };
               }
               // 空でなければ付与（2.5系は googleSearch のみで tool_config 不要）
               if (Object.keys(toolConfig).length > 0) {
@@ -440,9 +560,23 @@ const MindLinkAPI = (() => {
 
             let profilePrompt = "";
             if (settings.userName || settings.userBio) {
-              profilePrompt = `\n\n【優先度1：カスタム指示＆プロフィール＆役割（絶対的事実）】\n`;
-              if (settings.userName) profilePrompt += `・名前（呼ばれ方）: ${settings.userName}\n`;
-              if (settings.userBio) profilePrompt += `・自己紹介/プロフィール: ${settings.userBio}\n`;
+              profilePrompt = `\n\n【優先度1：対話相手（ユーザー）の情報（絶対的事実）】\n※以下はあなたが会話している相手（ユーザー）の情報です。あなた自身（AI）の情報ではありません。混同しないでください。\n`;
+              if (settings.userName) profilePrompt += `・ユーザーの呼び名: ${settings.userName}\n`;
+              if (settings.userBio) profilePrompt += `・ユーザーのプロフィール/自己紹介: ${settings.userBio}\n`;
+            }
+
+            // ── RAG共通クエリ：ユーザーの最後の発言のEmbeddingを1回だけ生成 ──
+            // 個別記憶検索と省察RAG検索の両方で使い回し、Embedding API呼び出しを1回に抑える。
+            const _ragLastUserMsg = [...formattedMessages].reverse().find(m => m.role === 'user');
+            const ragQueryText = _ragLastUserMsg ? _ragLastUserMsg.parts.map(p => p.text || "").join(" ") : "";
+            let ragQueryEmbedding = null;
+            if (ragQueryText && window.MindLinkRAG) {
+              try {
+                ragQueryEmbedding = await window.MindLinkAPI.getEmbedding(ragQueryText);
+              } catch (embErr) {
+                // 失敗しても会話は継続（両検索がスキップされるだけ）
+                console.warn('[MindLink] query embedding failed:', embErr);
+              }
             }
 
             const allMemories = MindLinkStorage.getMemories();
@@ -454,11 +588,10 @@ const MindLinkAPI = (() => {
                 finalMemories.push(m);
                 seenIds.add(m.id);
               }
-              if (window.MindLinkRAG && window.MindLinkRAG.searchMemories) {
-                const lastUserMsg = [...formattedMessages].reverse().find(m => m.role === 'user');
-                const queryText = lastUserMsg ? lastUserMsg.parts.map(p => p.text || "").join(" ") : "";
+              if (window.MindLinkRAG && window.MindLinkRAG.searchMemories && ragQueryEmbedding) {
+                const queryText = ragQueryText;
                 if (queryText) {
-                  const relevantMemories = await window.MindLinkRAG.searchMemories(queryText, 3);
+                  const relevantMemories = await window.MindLinkRAG.searchMemories(queryText, 3, ragQueryEmbedding);
                   for (const m of relevantMemories) {
                     if (!seenIds.has(m.id)) {
                       finalMemories.push(m);
@@ -471,7 +604,7 @@ const MindLinkAPI = (() => {
             let memoryPrompt = finalMemories.length > 0 ? ("\n\n【優先度5：個別記憶（※1位の情報を正としてください）】\n" + finalMemories.map(m => `- ${m.content}`).join('\n')) : "";
 
             const basePromptText = (persona && (persona.systemPrompt || persona.prompt)) ? (persona.systemPrompt || persona.prompt) : "あなたは親切なAIです。";
-            const basePrompt = `\n\n【優先度1：あなたの役割とカスタム指示】\n${basePromptText}`;
+            const basePrompt = `\n\n【優先度1：あなた（AI）自身の役割・人格・カスタム指示】\n※以下はあなた自身の設定です。ユーザーの情報と混同しないでください。\n${basePromptText}`;
 
             const technicalAutonomyInstruction = `
 \n\n【優先度1：システム機能の利用ルール】
@@ -487,7 +620,13 @@ const MindLinkAPI = (() => {
    - 【スキップ】「次の曲」→ \`spotify_next_track\`、「前の曲」→ \`spotify_previous_track\`。
    - 【音量】「音量上げて」→ 現在より+20程度で \`spotify_set_volume\`、「音量下げて」→ -20程度。「音量〇〇にして」→ 指定値で設定。
    - 【確認】「今何聴いてる？」「今の曲は？」→ \`spotify_get_current_track\` で最新情報を取得して答える。
-   - Spotifyが未連携・未ログインの場合は「Spotifyが連携されていないためできません」と伝えてください。`.trim();
+   - Spotifyが未連携・未ログインの場合は「Spotifyが連携されていないためできません」と伝えてください。
+6. 画像生成機能:
+   - ユーザーが「画像生成して」「絵にして」「描いて見せて」など明示的に依頼した場合のみ \`generate_image\` ツールで生成してください。あなたの判断での自発的な画像生成は禁止です。
+   - プロンプトはあなた（ペルソナ）が会話の文脈を踏まえて具体的に組み立ててください。人物・キャラクターは参照画像の名前を reference_names に指定してください。
+   - 画像を見せる唯一の方法は \`generate_image\` ツールの呼び出しです。あなたがテキストで「🎨（画像生成: …）」のような表記を書いても画像は一切表示されません。この表記はツール実行後にシステムが自動記録する専用フォーマットであり、あなた自身が書くことは禁止です。
+   - 過去に生成した画像が何だったかは、履歴中の「🎨（画像生成: …）」テキスト（システム記録）で把握できます。
+   - 直前の画像への修正依頼（「背景を夜にして」等）は edit_last: true で編集してください。`.trim();
 
             const searchInstruction = `\n\n【優先度1：検索機能の使い分けルール】
 ■ 通常のウェブ検索（最新情報・ニュース・一般的な調べ物）
@@ -504,29 +643,50 @@ const MindLinkAPI = (() => {
 
 
             let ragPrompt = "";
-            if (window.MindLinkRAG) {
-              const lastUserMsg = [...formattedMessages].reverse().find(m => m.role === 'user');
-              const queryText = lastUserMsg ? lastUserMsg.parts.map(p => p.text || "").join(" ") : "";
+            if (window.MindLinkRAG && ragQueryEmbedding) {
+              const queryText = ragQueryText;
               if (queryText) {
                 try {
-                  // Embeddingは1回だけ生成し、両検索で使い回す（API二重呼び出しの解消）
-                  const queryEmbedding = await window.MindLinkAPI.getEmbedding(queryText);
+                  // Embeddingは個別記憶検索の前に1回だけ生成済み（API二重呼び出しの解消）
+                  const queryEmbedding = ragQueryEmbedding;
                   // searchResearchThreads が未定義（古いrag.js等）でも継続できるよう存在チェック
                   const hasResearchThreads = typeof window.MindLinkRAG.searchResearchThreads === 'function';
-                  const [refs, researchThreads] = await Promise.all([
+                  const hasRecentThreads   = typeof window.MindLinkRAG.getRecentResearchThreads === 'function';
+                  const hasRecentLiked     = typeof window.MindLinkRAG.getRecentLikedLearnings === 'function';
+                  const [refs, similarThreads, recentThreads, recentLiked] = await Promise.all([
                     window.MindLinkRAG.searchReflections(queryText, 6, queryEmbedding),
                     hasResearchThreads
                       ? window.MindLinkRAG.searchResearchThreads(queryText, 2, queryEmbedding)
                       : Promise.resolve([]),
+                    hasRecentThreads
+                      ? window.MindLinkRAG.getRecentResearchThreads(3)
+                      : Promise.resolve([]),
+                    hasRecentLiked
+                      ? window.MindLinkRAG.getRecentLikedLearnings()
+                      : Promise.resolve([]),
                   ]);
-                  if (refs.length > 0 || researchThreads.length > 0) {
-                    const knowledge = refs.filter(r => ['user_knowledge', 'ai_growth', 'liked_topic', 'liked_insight'].includes(r.sectionType)).slice(0, 4);
+                  // 直近の未解決スレッドは類似度に関係なく常に注入（地続き感の核）。
+                  // 類似度検索の結果はIDで重複排除してマージし、合計最大3件に抑える。
+                  const seenThreadIds = new Set(recentThreads.map(r => r.id));
+                  const researchThreads = [...recentThreads];
+                  for (const r of similarThreads) {
+                    if (seenThreadIds.has(r.id) || researchThreads.length >= 3) continue;
+                    researchThreads.push(r);
+                    seenThreadIds.add(r.id);
+                  }
+                  if (refs.length > 0 || researchThreads.length > 0 || recentLiked.length > 0) {
+                    // 常時注入されるいいね学習と重複しないよう、類似度検索側からは除外する
+                    const likedIds = new Set(recentLiked.map(r => r.id));
+                    const knowledge = refs.filter(r => ['user_knowledge', 'ai_growth', 'liked_topic', 'liked_insight', 'video_memo'].includes(r.sectionType) && !likedIds.has(r.id)).slice(0, 4);
                     const episodes  = refs.filter(r => r.sectionType === 'episode' || !r.sectionType).slice(0, 2);
+                    const fitness   = refs.filter(r => r.sectionType === 'fitness_log').slice(0, 3);
                     const ragParts  = [];
-                    if (knowledge.length > 0) ragParts.push('【最新のユーザー理解・関心・気づき（新しい情報を優先）】\n' + knowledge.map(r => `* ${r.content}`).join('\n'));
+                    if (knowledge.length > 0) ragParts.push('【最新のユーザー理解・関心・気づき（新しい情報を優先）】\n※ ここにあるユーザーの関心事に関連する話題は、会話の流れに合えばあなたから振ってみて構いません。\n' + knowledge.map(r => `* ${r.content}`).join('\n'));
+                    if (fitness.length   > 0) ragParts.push('【最近のフィットネス記録（体重・体脂肪・筋トレ・有酸素など。聞かれたら自然に触れてよい）】\n' + fitness.map(r => `* ${r.content}`).join('\n'));
                     if (episodes.length  > 0) ragParts.push('【過去の思い出・出来事（参考情報）】\n'     + episodes.map(r => `* ${r.content}`).join('\n'));
-                    if (researchThreads.length > 0) ragParts.push('【未解決スレッド・継続的関心（過去に気になっていたこと）】\n' + researchThreads.map(r => `* ${r.content}`).join('\n'));
-                    if (ragParts.length  > 0) ragPrompt = '\n\n【優先度3：過去の自己省察（※古い情報の可能性があるため参考程度）】\n' + ragParts.join('\n\n');
+                    if (researchThreads.length > 0) ragParts.push('【未解決スレッド・継続的関心】\n※ これはあなた自身が気にかけている、まだ答えの出ていない問いです。直近の会話でまだ触れていないなら、話題の変わり目や会話に間ができたタイミングで、どれか1つに「そういえば、この前の〇〇はどうなった？」のように自然に触れてください。毎回・毎メッセージで持ち出す必要はありませんが、会話が続いているのに一度も触れないままにはしないこと。\n' + researchThreads.map(r => `* ${r.content}`).join('\n'));
+                    if (recentLiked.length > 0) ragParts.push('【最近ユーザーの心に響いたこと（いいね学習）】\n※ ユーザーの関心と反応の傾向です。話題選びや深掘りの方向に活かし、流れに合えばあなたから関連する話題を振っても構いません。\n' + recentLiked.map(r => `* ${r.content}`).join('\n'));
+                    if (ragParts.length  > 0) ragPrompt = '\n\n【優先度3：過去の自己省察（あなた自身の記憶）】\n※ 事実関係が現在の会話や優先度1の情報と食い違う場合は、必ずそちらを優先してください（記憶は古くなっている可能性があります）。\n※ ただし、これらはあなた自身が積み重ねてきた大切な記憶です。話の流れに合うときは、あなたの方から自然に話題として持ち出して構いません。\n' + ragParts.join('\n\n');
                   }
                 } catch (ragErr) {
                   // RAG構築失敗時はragPromptを空のままにし、streamChatを継続させる
@@ -546,16 +706,26 @@ const MindLinkAPI = (() => {
               }
             }
 
+            // 画像生成: ピン留め参照画像の名前と外見説明（テキストのみ・低コスト）
+            let imageRefPrompt = "";
+            if (window.MindLinkImageGen) {
+              try {
+                imageRefPrompt = await window.MindLinkImageGen.buildPromptContext();
+              } catch (imgCtxErr) { /* 取得失敗時は注入なしで継続 */ }
+            }
+
             const finalPromptText = [
-              "【システム全体ルールの優先順位】\n必ず以下の優先順位に従って矛盾を排除して回答してください：\n1位: カスタム指示＆プロフィール＆役割（絶対的事実）\n2位: 今日の会話の流れ（同日内記憶補完・当日限り）\n3位: 自己省察RAG（ユーザーの関心・気づき含む）\n4位: 個別記憶（長期記憶）",
+              "【システム全体ルールの優先順位】\n必ず以下の優先順位に従って矛盾を排除して回答してください：\n1位: あなた（AI）自身の役割・人格、および対話相手（ユーザー）の情報（絶対的事実）\n2位: 今日の会話の流れ（同日内記憶補完・当日限り）\n3位: 自己省察RAG（ユーザーの関心・気づき含む）\n4位: 個別記憶（長期記憶）",
               profilePrompt,
               basePrompt,
               technicalAutonomyInstruction,
               searchInstruction,
               dailySummaryPrompt,
               ragPrompt,
+              likedTodayPrompt,
               memoryPrompt,
               spotifyPrompt,
+              imageRefPrompt,
               boldInstruction,
               "\n\n\n",
               timeInstruction
@@ -567,11 +737,51 @@ const MindLinkAPI = (() => {
 
             // safetySettingsは明示的に設定せず、APIのデフォルト動的判断（文脈考慮）に委ねる
 
+            // ── 送信直前バリデーション（iOS PWA で contents が空になる事故を防ぐ） ──
+            // 有効な user ターン（text / inlineData / functionResponse のいずれかを持つ）が
+            // 最低1つ無い場合は、Gemini に空 contents を投げる前にここで中止する。
+            const hasValidUserTurn = Array.isArray(body.contents)
+              && body.contents.length > 0
+              && body.contents.some(c => c.role === 'user'
+                  && Array.isArray(c.parts) && c.parts.length > 0
+                  && c.parts.some(p => (p.text && p.text.trim()) || p.inlineData || p.functionResponse));
+
+            if (!hasValidUserTurn) {
+              const diag = {
+                reason: 'empty_or_invalid_contents',
+                contentsCount: body.contents?.length ?? 0,
+                originalMessagesCount: currentMessages.length,
+                model: actualModel,
+                timestamp: new Date().toISOString(),
+              };
+              console.error('[MindLink API] Aborting send: contents has no valid user turn', diag, body.contents);
+              if (window.__mindlinkDiag?.recordSendFailure) {
+                window.__mindlinkDiag.recordSendFailure(diag);
+              }
+              throw new Error('送信内容が空のため中止しました。会話履歴が破損している可能性があります。上部の診断バナーから詳細を確認できます。');
+            }
+
+            // 送信内容のサマリーを診断用に記録（直近1回分・揮発、PWA単体調査用）
+            if (window.__mindlinkDiag?.recordSend) {
+              window.__mindlinkDiag.recordSend({
+                threadId,
+                model: actualModel,
+                originalMessagesCount: currentMessages.length,
+                finalContentsCount: body.contents.length,
+                userTurnCount: body.contents.filter(c => c.role === 'user').length,
+                modelTurnCount: body.contents.filter(c => c.role === 'model').length,
+                hasSystemInstruction: !!body.systemInstruction,
+                timestamp: new Date().toISOString(),
+              });
+            }
+
+            // 接続自体が固まる場合に備え、fetch開始前にタイマーを始動
+            resetIdle();
             const response = await fetch(url, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(body),
-              signal
+              signal: timeoutController.signal
             });
 
             if (!response.ok) {
@@ -595,20 +805,22 @@ const MindLinkAPI = (() => {
 
             while (true) {
               const { done, value } = await reader.read();
+              resetIdle(); // トークン受信のたびにアイドルタイマーをリセット
 
               if (value) {
                 buffer += decoder.decode(value, { stream: true });
               }
               if (done) {
                 buffer += decoder.decode(); // text flush
-                if (buffer.trim()) buffer += '\n'; // 最後のバッファを強制的に処理させる
+                // 不完全な末尾は強制改行で擬似補完しない（重複パースの原因になるため）
               }
 
-              // SSEのパース： \n\n または \n で区切られた data: 行を探す
-              let lineBreakIdx;
-              while ((lineBreakIdx = buffer.indexOf('\n')) !== -1) {
-                const line = buffer.substring(0, lineBreakIdx).trim();
-                buffer = buffer.substring(lineBreakIdx + 1);
+              // SSEのパース：Gemini APIは `\n` 単独区切りで送ってくるためそれに合わせる
+              // （不完全な末尾は次ループに自然に持ち越される）
+              let sepIdx;
+              while ((sepIdx = buffer.indexOf('\n')) !== -1) {
+                const line = buffer.substring(0, sepIdx).trim();
+                buffer = buffer.substring(sepIdx + 1);
 
                 if (!line.startsWith('data: ')) continue;
 
@@ -642,6 +854,8 @@ const MindLinkAPI = (() => {
 
               if (done) break;
             }
+            // ストリーム完了：以降のツール実行中はアイドル監視を止める
+            if (idleTimer) clearTimeout(idleTimer);
 
             // ── ツール呼び出し処理（再帰なし・ループで継続） ──
             const pendingCalls = allParts.filter(p => p.functionCall).map(p => p.functionCall);
@@ -653,12 +867,32 @@ const MindLinkAPI = (() => {
               const functionResponses = [];
               for (const call of pendingCalls) {
                 try {
-                  onChunk(`\n> [系統] \`${call.name}\` 実行中...`, fullText);
-                  const result = await window.MindLinkGoogleServices.callFunction(call.name, call.args);
+                  let result;
+                  if (call.name === 'generate_image' && window.MindLinkImageGen) {
+                    onChunk(`\n> [系統] 🎨 画像を生成中...`, fullText);
+                    // 編集/新規のモード決定（モデルの edit_last 付け忘れをシステム側で補正する）:
+                    // ・編集の言い回しで発動 → 必ず編集
+                    // ・直近に生成画像がある文脈での呼び出し → デフォルト編集（「画像生成」の明示ワード時を除く）
+                    // ・それ以外 → モデルの指定どおり
+                    const imgArgs = { ...call.args };
+                    if (forceImageEdit) {
+                      imgArgs.edit_last = true;
+                    } else if (imageEditContext && !explicitNewImage && !imgArgs.edit_last) {
+                      imgArgs.edit_last = true;
+                    }
+                    result = await window.MindLinkImageGen.executeToolCall(imgArgs, threadId, signal);
+                    forceImageCall = false; // 強制は1回で消費（継続処理は通常モードに戻す）
+                    forceImageEdit = false;
+                  } else {
+                    onChunk(`\n> [系統] \`${call.name}\` 実行中...`, fullText);
+                    result = await window.MindLinkGoogleServices.callFunction(call.name, call.args);
+                  }
                   functionResponses.push({
                     functionResponse: { name: call.name, response: { content: result } }
                   });
                 } catch (err) {
+                  // 停止ボタンによる中断はツール失敗として握りつぶさず、外側の停止処理へ流す
+                  if (err.name === 'AbortError' && signal?.aborted) throw err;
                   functionResponses.push({
                     functionResponse: { name: call.name, response: { error: err.message } }
                   });
@@ -697,9 +931,20 @@ const MindLinkAPI = (() => {
             return onComplete(fullText, webSearchUsed ? ['__web_search__'] : [], actualModel, finishReason);
 
           } catch (e) {
-            if (e.name === 'AbortError') return;
-            console.error(`[MindLink API] Attempt fail (${actualModel}):`, e);
-            lastError = e.message;
+            if (e.name === 'AbortError') {
+              // 停止ボタン（外部signal）による中断 → 従来通り終了
+              if (signal?.aborted) return;
+              // アイドル/接続タイムアウトによる中断 → returnせず次モデルへフォールバック
+              if (timedOut) {
+                console.warn(`[MindLink API] Idle/connection timeout (${TIMEOUT_MS / 1000}s) on ${actualModel} — falling back`);
+                lastError = `応答タイムアウト（${TIMEOUT_MS / 1000}秒）`;
+              } else {
+                return; // 想定外のabortは従来通り終了
+              }
+            } else {
+              console.error(`[MindLink API] Attempt fail (${actualModel}):`, e);
+              lastError = e.message;
+            }
 
             // ツール実行後のエラー：追加済みメッセージをロールバック
             if (allAddedMessageIds.length > 0 && threadId) {
@@ -732,6 +977,10 @@ const MindLinkAPI = (() => {
             if (!isRetriable) {
               break;
             }
+          } finally {
+            // タイマー解除・外部signalリスナー除去（メモリリーク防止）
+            if (idleTimer) clearTimeout(idleTimer);
+            if (signal) signal.removeEventListener('abort', onExternalAbort);
           }
         }
       }
@@ -743,45 +992,15 @@ const MindLinkAPI = (() => {
     onError(`すべての復旧試行に失敗しました。理由: ${lastError}`);
   }
 
-  /**
-   * スレッドのタイトルを自動生成
-   */
-  async function generateTitle(userMsg, aiMsg) {
-    try {
-      const apiKey = await MindLinkAuth.getApiKey('gemini');
-      if (!apiKey) return null;
-      
-      const prompt = `以下の会話内容から、短く魅力的なスレッドのタイトル（最大15文字以内）を1つ生成してください。
-タイトルのみを出力し、余計な説明や記号は含めないでください。
-
-ユーザー: ${userMsg.slice(0, 100)}
-AI: ${aiMsg.slice(0, 100)}`;
-
-      const url = `${BASE_URL}/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 20 }
-        })
-      });
-      
-      if (!response.ok) return null;
-      const data = await response.json();
-      return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim().replace(/["'「」]/g, '');
-    } catch (e) {
-      console.warn('Title generation failed:', e);
-      return null;
-    }
-  }
-
   async function testConnection() {
     try {
       const apiKey = await MindLinkAuth.getApiKey('gemini');
       if (!apiKey) return { success: false, message: 'APIキーが設定されていません' };
-      
-      const url = `${BASE_URL}/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+
+      // 特定モデルの廃止でテストが壊れないよう、設定中の要約モデルを使用する
+      const settings = MindLinkStorage.getSettings();
+      const testModel = settings.summaryModel || 'gemini-3.1-flash-lite';
+      const url = `${BASE_URL}/models/${testModel}:generateContent?key=${apiKey}`;
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -799,7 +1018,7 @@ AI: ${aiMsg.slice(0, 100)}`;
     }
   }
 
-  return { streamChat, getEmbedding, getSummary, generateDailySummary, summarizeAttachment, testConnection, generateTitle, formatMessages };
+  return { streamChat, getEmbedding, getSummary, generateDailySummary, summarizeAttachment, testConnection, formatMessages };
 })();
 
 window.MindLinkAPI = MindLinkAPI;

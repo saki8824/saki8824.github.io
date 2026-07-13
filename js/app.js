@@ -24,6 +24,19 @@ const MindLinkApp = (() => {
     if (window.MindLinkCamera) MindLinkCamera.init();
     MindLinkReflection.initListeners();
 
+    // ── 追い省察: 前日の未省察分があれば自動実行 ──
+    // 起動直後の負荷を避けて少し遅らせる。ロック中はスキップ（APIキーが使えないため。
+    // その場合も記憶ノートのバナーから手動実行できる）。
+    setTimeout(() => {
+      try {
+        if (!MindLinkAuth.isLocked() && window.MindLinkReflection?.runCatchupReflectionIfNeeded) {
+          MindLinkReflection.runCatchupReflectionIfNeeded();
+        }
+      } catch (e) {
+        console.warn('[MindLink] 追い省察チェックに失敗:', e);
+      }
+    }, 8000);
+
     // ── OAuth コールバック振り分け ──
     // Spotify は state が 'spotify_' で始まる。Google と干渉しないよう先に処理する。
     const _urlParams    = new URLSearchParams(window.location.search);
@@ -54,6 +67,9 @@ const MindLinkApp = (() => {
     }
     setupAutonomousTimer();
     setupVisibilityHandler();
+
+    // 起動時データ整合性チェック（検知・ログ・診断バナーのみ／削除はしない）
+    Diagnostics.runStartupCheck();
   }
 
   // 保存済みフォントサイズをDOMに適用
@@ -187,6 +203,44 @@ const MindLinkApp = (() => {
     initAppUI();
     // PIN解除後に自律発話タイマーを再評価（1時間経過チェック含む）
     resetAutonomousTimer();
+    // localStorageに残るアーカイブ済みスレッドをIndexedDB倉庫へ移行（確認ポップアップ付き）
+    setTimeout(() => migrateArchivedThreadsToIDB(), 800);
+  }
+
+  // アーカイブ済みスレッドの会話本文を localStorage → IndexedDB倉庫 へ移行する。
+  // データが消える瞬間が無いよう「IDBに書く→検証→localStorage削除」の順で行う。
+  async function migrateArchivedThreadsToIDB() {
+    let ids;
+    try {
+      ids = MindLinkStorage.getUnmigratedArchivedThreadIds();
+    } catch (e) {
+      console.error('[MindLink] migration detect failed:', e);
+      return;
+    }
+    if (!ids || ids.length === 0) return;
+
+    showConfirm(
+      'データ移行',
+      `アーカイブ済みの ${ids.length} 件のスレッドをデータベースに移動して、localStorageの容量を空けます。\n（会話は消えません。アーカイブからこれまで通り閲覧できます）\n実行しますか？`,
+      async () => {
+        let moved = 0;
+        for (const id of ids) {
+          try {
+            const messages = MindLinkStorage.getMessages(id);
+            await MindLinkStorage.idbPutArchivedMessages(id, messages);
+            const check = await MindLinkStorage.idbGetArchivedMessages(id);
+            if (check === null || check.length !== messages.length) {
+              throw new Error('IndexedDBへの書き込み検証に失敗');
+            }
+            MindLinkStorage.remove('messages_' + id);
+            moved++;
+          } catch (e) {
+            console.error('[MindLink] migrate failed for', id, e);
+          }
+        }
+        showToast(`${moved}件のスレッドを移行しました`);
+      }
+    );
   }
 
   function initAppUI() {
@@ -208,7 +262,7 @@ const MindLinkApp = (() => {
   }
 
   // ── スレッド選択 ──
-  function selectThread(id) {
+  async function selectThread(id) {
     MindLinkThreads.setCurrentThreadId(id);
     const thread = MindLinkStorage.getThread(id);
     if (!thread) return;
@@ -253,7 +307,7 @@ const MindLinkApp = (() => {
 
     MindLinkPersonas.selectPersona(thread.personaId);
 
-    MindLinkChat.loadMessages(id);
+    await MindLinkChat.loadMessages(id);
     MindLinkThreads.renderThreadList();
 
     // モバイルでサイドバーを閉じる
@@ -369,6 +423,120 @@ const MindLinkApp = (() => {
     _toastTimeout = setTimeout(() => toast.classList.remove('active'), 3000);
   }
 
+  // ── 進捗インジケーター（常駐・完了で消す。省察など時間のかかる処理用） ──
+  // showProgress(text) で表示/更新、hideProgress() で消去。何度呼んでも安全（冪等）。
+  function showProgress(text) {
+    let bar = document.getElementById('app-progress-bar');
+    if (!bar) {
+      // スピナー回転用のキーフレームを一度だけ注入
+      if (!document.getElementById('app-progress-style')) {
+        const style = document.createElement('style');
+        style.id = 'app-progress-style';
+        style.textContent = '@keyframes app-progress-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}';
+        document.head.appendChild(style);
+      }
+      bar = document.createElement('div');
+      bar.id = 'app-progress-bar';
+      bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:100000;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:13px;line-height:1.4;padding:8px 12px;display:flex;align-items:center;gap:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);';
+      const spinner = document.createElement('span');
+      spinner.textContent = '🌙';
+      spinner.style.cssText = 'display:inline-block;animation:app-progress-spin 1.2s linear infinite;';
+      const label = document.createElement('span');
+      label.id = 'app-progress-text';
+      label.style.flex = '1 1 auto';
+      bar.append(spinner, label);
+      document.body.appendChild(bar);
+    }
+    const label = document.getElementById('app-progress-text');
+    if (label) label.textContent = text;
+  }
+
+  function hideProgress() {
+    document.getElementById('app-progress-bar')?.remove();
+  }
+
+  // ── アーカイブ一括エクスポート（JSONファイルとしてダウンロード） ──
+  // 読み取りのみ。既存データは一切変更・削除しない。
+  async function exportArchive() {
+    const data = await MindLinkStorage.exportArchivedThreads();
+    if (!data || data.threadCount === 0) {
+      showToast('アーカイブされたスレッドがありません');
+      return;
+    }
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const today = new Date();
+    const ymd = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`;
+    const filename = `mindlink-archive-${ymd}.json`;
+
+    // 標準ダウンロード（<a download>）
+    try {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast(`${data.threadCount}件のスレッドをエクスポートしました`);
+    } catch (e) {
+      // iOS PWA フォールバック：新規タブで開いて「共有→ファイルに保存」してもらう
+      console.warn('[MindLink] export download fallback:', e);
+      try {
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+        showToast('開いたページから「共有→ファイルに保存」してください');
+      } catch (e2) {
+        console.error('[MindLink] export failed:', e2);
+        showToast('エクスポートに失敗しました');
+      }
+    }
+  }
+
+  // ── アーカイブ一括インポート ──
+  // 取り込んだスレッドは必ずアーカイブ状態で入る（本文はIndexedDB倉庫へ）。
+  function importArchive() {
+    document.getElementById('input-import-archive')?.click();
+  }
+
+  async function handleImportArchiveFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ''; // 同じファイルを再選択できるようリセット
+    if (!file) return;
+
+    let data;
+    try {
+      const text = await file.text();
+      data = JSON.parse(text);
+    } catch (err) {
+      console.error('[MindLink] import read/parse failed:', err);
+      showToast('ファイルを読み込めませんでした');
+      return;
+    }
+    if (!data || data.format !== 'mindlink-archive-export' || !Array.isArray(data.threads)) {
+      showToast('対応していないファイル形式です');
+      return;
+    }
+
+    const count = data.threads.length;
+    showConfirm(
+      'アーカイブを読み込む',
+      `このファイルから ${count} 件のスレッドをアーカイブに取り込みます。\n（既に同じスレッドがある場合はスキップされます）\n実行しますか？`,
+      async () => {
+        try {
+          const result = await MindLinkStorage.importArchivedThreads(data);
+          MindLinkThreads.renderArchiveList();
+          MindLinkThreads.renderThreadList();
+          showToast(`${result.imported}件を取り込みました（${result.skipped}件はスキップ）`);
+        } catch (err) {
+          console.error('[MindLink] import error:', err);
+          showToast(err.message || 'インポートに失敗しました');
+        }
+      }
+    );
+  }
+
   // ── サイドバー ──
   function openSidebar() {
     document.getElementById('sidebar')?.classList.add('open');
@@ -476,6 +644,15 @@ const MindLinkApp = (() => {
     const summaryModelSel = document.getElementById('setting-summary-model');
     if (summaryModelSel) summaryModelSel.value = settings.summaryModel || 'gemini-3.5-flash';
 
+    // 画像生成設定
+    const imageModelSel = document.getElementById('setting-image-model');
+    if (imageModelSel) imageModelSel.value = settings.imageModel || 'gemini-3.1-flash-image';
+    const imageAspectSel = document.getElementById('setting-image-aspect');
+    if (imageAspectSel) imageAspectSel.value = settings.imageAspectRatio || '1:1';
+    const imageResSel = document.getElementById('setting-image-resolution');
+    if (imageResSel) imageResSel.value = settings.imageResolution || '2K';
+    renderReferenceImageList();
+
     // APIキー状態表示
     const apiKeyInput = document.getElementById('settings-api-key');
     if (apiKeyInput) {
@@ -498,10 +675,193 @@ const MindLinkApp = (() => {
     const googleClientSecret = document.getElementById('setting-google-client-secret')?.value.trim();
     const searchEngineId = document.getElementById('setting-search-engine-id')?.value.trim();
     const spotifyClientId = document.getElementById('setting-spotify-client-id')?.value.trim();
+    const imageModel = document.getElementById('setting-image-model')?.value;
+    const imageAspectRatio = document.getElementById('setting-image-aspect')?.value;
+    const imageResolution = document.getElementById('setting-image-resolution')?.value;
 
-    MindLinkStorage.updateSettings({ temperature, maxTokens, autoLockMinutes, fontSize, summaryModel, googleClientId, googleClientSecret, searchEngineId, spotifyClientId });
+    MindLinkStorage.updateSettings({ temperature, maxTokens, autoLockMinutes, fontSize, summaryModel, googleClientId, googleClientSecret, searchEngineId, spotifyClientId, imageModel, imageAspectRatio, imageResolution });
     MindLinkAuth.resetLockTimer();
     showToast('設定を保存しました');
+  }
+
+  // ── 参照画像ライブラリ（画像生成タブ） ──
+
+  async function renderReferenceImageList() {
+    const listEl = document.getElementById('reference-image-list');
+    if (!listEl) return;
+    let refs = [];
+    try {
+      refs = await MindLinkStorage.getReferenceImages();
+    } catch (e) {
+      console.warn('[MindLink] 参照画像の読み込みに失敗:', e);
+      return;
+    }
+    refs.sort((a, b) => a.createdAt - b.createdAt);
+    listEl.innerHTML = '';
+
+    for (const ref of refs) {
+      const item = document.createElement('div');
+      item.className = 'reference-image-item';
+
+      const thumb = document.createElement('img');
+      thumb.className = 'reference-image-thumb';
+      thumb.src = ref.data;
+      thumb.alt = '';
+
+      // 名前とメモを縦に並べる入力欄コンテナ
+      const fields = document.createElement('div');
+      fields.style.cssText = 'flex:1;min-width:0;display:flex;flex-direction:column;gap:6px;';
+
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.className = 'reference-image-name';
+      nameInput.value = ref.name || '';
+      nameInput.placeholder = '名前（例: ゆんみ）';
+      nameInput.addEventListener('change', async () => {
+        const name = nameInput.value.trim();
+        if (!name) {
+          showToast('名前を入力してください');
+          nameInput.value = ref.name || '';
+          return;
+        }
+        const all = await MindLinkStorage.getReferenceImages();
+        if (all.some(r => r.id !== ref.id && r.name === name)) {
+          showToast(`「${name}」は既に使われています。別の名前にしてください`);
+          nameInput.value = ref.name || '';
+          return;
+        }
+        await MindLinkStorage.updateReferenceImage(ref.id, { name });
+        showToast(`名前を「${name}」に変更しました`);
+        renderReferenceImageList();
+      });
+
+      // 体型・特徴メモ（任意）: 画像生成時に「顔・髪型は参照画像、体型はこのメモ」として反映される
+      const noteInput = document.createElement('input');
+      noteInput.type = 'text';
+      noteInput.className = 'reference-image-name';
+      noteInput.value = ref.bodyNote || '';
+      noteInput.placeholder = '体型・特徴メモ（例: ややぽっちゃり・色白）';
+      noteInput.addEventListener('change', async () => {
+        await MindLinkStorage.updateReferenceImage(ref.id, { bodyNote: noteInput.value.trim() });
+        showToast('特徴メモを保存しました');
+      });
+
+      const pinBtn = document.createElement('button');
+      pinBtn.className = 'reference-image-pin-btn' + (ref.isPinned ? ' pinned' : '');
+      pinBtn.title = '常時参照（最大2枚）。ピン留めした画像の外見はペルソナが常に把握します';
+      pinBtn.textContent = ref.isPinned ? '📌' : '📍';
+      pinBtn.addEventListener('click', async () => {
+        if (!ref.isPinned) {
+          const all = await MindLinkStorage.getReferenceImages();
+          if (all.filter(r => r.isPinned).length >= 2) {
+            showToast('ピン留めは2枚までです。先にどれかを外してください');
+            return;
+          }
+        }
+        await MindLinkStorage.updateReferenceImage(ref.id, { isPinned: !ref.isPinned });
+        renderReferenceImageList();
+      });
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'reference-image-delete-btn';
+      deleteBtn.title = '削除';
+      deleteBtn.textContent = '🗑';
+      deleteBtn.addEventListener('click', () => {
+        showConfirm('参照画像を削除', `「${ref.name}」を削除しますか？\nペルソナはこの画像を参照できなくなります。`, async () => {
+          await MindLinkStorage.deleteReferenceImage(ref.id);
+          renderReferenceImageList();
+          showToast('参照画像を削除しました');
+        });
+      });
+
+      item.appendChild(thumb);
+      fields.appendChild(nameInput);
+      fields.appendChild(noteInput);
+      item.appendChild(fields);
+      item.appendChild(pinBtn);
+      item.appendChild(deleteBtn);
+      listEl.appendChild(item);
+    }
+
+    // 上限（5枚）で追加ボタンを無効化
+    const addBtn = document.getElementById('btn-add-reference-image');
+    if (addBtn) {
+      addBtn.disabled = refs.length >= 5;
+      addBtn.textContent = refs.length >= 5 ? '上限（5枚）に達しています' : '＋ 画像を追加';
+    }
+  }
+
+  // 追加時の縮小: 長辺1024pxのJPEGに変換（IndexedDB容量と生成時の送信トークンの節約）
+  function resizeImageFile(file, maxDim = 1024) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const width = Math.round(img.width * scale);
+          const height = Math.round(img.height * scale);
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.85));
+        };
+        img.onerror = () => reject(new Error('画像の読み込みに失敗しました'));
+        img.src = reader.result;
+      };
+      reader.onerror = () => reject(new Error('ファイルの読み込みに失敗しました'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function initReferenceImageEvents() {
+    const addBtn = document.getElementById('btn-add-reference-image');
+    const fileInput = document.getElementById('input-reference-image');
+    addBtn?.addEventListener('click', () => fileInput?.click());
+    fileInput?.addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+
+      const name = window.prompt('この画像の名前を入力してください（例: ゆんみ、レン）\nペルソナはこの名前で画像を認識します。');
+      if (!name || !name.trim()) {
+        showToast('名前が未入力のため追加を中止しました');
+        return;
+      }
+      const trimmedName = name.trim();
+
+      try {
+        const all = await MindLinkStorage.getReferenceImages();
+        if (all.some(r => r.name === trimmedName)) {
+          showToast(`「${trimmedName}」は既に使われています。別の名前にしてください`);
+          return;
+        }
+        showToast('画像を処理しています…');
+        const dataUrl = await resizeImageFile(file, 1024);
+
+        // 外見説明を自動生成（1回だけ・失敗しても説明なしで追加を続行）
+        let description = '';
+        try {
+          description = await MindLinkImageGen.describeReferenceImage(dataUrl);
+        } catch (descErr) {
+          console.warn('[MindLink] 参照画像の説明生成に失敗（説明なしで保存）:', descErr);
+        }
+
+        await MindLinkStorage.saveReferenceImage({
+          name: trimmedName,
+          data: dataUrl,
+          mimeType: 'image/jpeg',
+          description,
+          isPinned: false,
+        });
+        renderReferenceImageList();
+        showToast(`参照画像「${trimmedName}」を追加しました ✨`);
+      } catch (err) {
+        console.error('[MindLink] 参照画像の追加に失敗:', err);
+        showToast(err.message || '参照画像の追加に失敗しました');
+      }
+    });
   }
 
   // ── PINキーパッド処理 ──
@@ -731,6 +1091,9 @@ const MindLinkApp = (() => {
       MindLinkThreads.setCurrentThreadId(thread.id);
       MindLinkChat.clearMessages();
       document.getElementById('current-thread-title').textContent = '新しいチャット';
+      // モデルセレクトの表示を新スレッドの実モデル（=保留中の選択）に同期
+      const _ms = document.getElementById('thread-model-select');
+      if (_ms) _ms.value = thread.model;
       MindLinkPersonas.selectPersona(thread.personaId);
       MindLinkThreads.renderThreadList();
       if (window.innerWidth <= 700) closeSidebar();
@@ -843,13 +1206,19 @@ const MindLinkApp = (() => {
     });
 
     // ── スレッド内モデル選択 ──
-    document.getElementById('thread-model-select')?.addEventListener('change', (e) => {
-      const threadId = MindLinkThreads.getCurrentThreadId();
-      if (threadId) {
-        MindLinkThreads.updateThreadModel(threadId, e.target.value);
+    const modelSelectEl = document.getElementById('thread-model-select');
+    if (modelSelectEl) {
+      // 起動時：保留中（UIで最後に選んだ）モデルを表示に反映し、実モデルと一致させる
+      modelSelectEl.value = MindLinkThreads.getPendingModel();
+      modelSelectEl.addEventListener('change', (e) => {
+        const model = e.target.value;
+        // スレッド未作成でも選択を保持（createThread時にこの値が使われる）
+        MindLinkThreads.setPendingModel(model);
+        const threadId = MindLinkThreads.getCurrentThreadId();
+        if (threadId) MindLinkThreads.updateThreadModel(threadId, model);
         MindLinkApp.showToast('モデルを更新しました');
-      }
-    });
+      });
+    }
 
     // ── 設定タブ ──
     document.querySelectorAll('.settings-tab').forEach(tab => {
@@ -862,9 +1231,12 @@ const MindLinkApp = (() => {
     });
 
     // 設定変更イベント（リアルタイム保存）
-    ['setting-model', 'setting-temperature', 'setting-max-tokens', 'setting-auto-lock', 'setting-font-size', 'setting-summary-model'].forEach(id => {
+    ['setting-model', 'setting-temperature', 'setting-max-tokens', 'setting-auto-lock', 'setting-font-size', 'setting-summary-model', 'setting-image-model', 'setting-image-aspect', 'setting-image-resolution'].forEach(id => {
       document.getElementById(id)?.addEventListener('change', saveSettings);
     });
+
+    // 参照画像ライブラリ（画像生成タブ）
+    initReferenceImageEvents();
 
     // モーダル全体の保存ボタン
     document.getElementById('btn-save-settings')?.addEventListener('click', saveSettings);
@@ -1010,6 +1382,11 @@ const MindLinkApp = (() => {
         if (errorEl) errorEl.textContent = result.error;
       }
     });
+
+    // アーカイブ一括エクスポート / インポート
+    document.getElementById('btn-export-archive')?.addEventListener('click', exportArchive);
+    document.getElementById('btn-import-archive')?.addEventListener('click', importArchive);
+    document.getElementById('input-import-archive')?.addEventListener('change', handleImportArchiveFile);
 
     // リセット
     document.getElementById('btn-reset-app')?.addEventListener('click', () => {
@@ -1186,13 +1563,14 @@ const MindLinkApp = (() => {
       MindLinkThreads.renderThreadList();
       hideContextMenu();
     });
-    document.getElementById('ctx-archive')?.addEventListener('click', () => {
+    document.getElementById('ctx-archive')?.addEventListener('click', async () => {
       if (!_contextMenuThreadId) return showToast('メッセージを送信すると操作可能になります');
-      MindLinkThreads.archiveThread(_contextMenuThreadId);
+      hideContextMenu();
+      const ok = await MindLinkThreads.archiveThread(_contextMenuThreadId);
+      if (!ok) return; // 失敗時は archiveThread 内でトースト表示済み
       MindLinkChat.clearMessages();
       document.getElementById('current-thread-title').textContent = '新しいチャット';
       MindLinkThreads.renderThreadList();
-      hideContextMenu();
       showToast('アーカイブしました');
     });
     document.getElementById('ctx-export')?.addEventListener('click', () => {
@@ -1241,6 +1619,260 @@ const MindLinkApp = (() => {
     });
   }
 
+  // ─────────────────────────────────────────────────────────────
+  //  起動時データ整合性チェック & 診断バナー（window.__mindlinkDiag）
+  //  - 破損の「検知・ログ・診断情報コピー」のみ。自動削除はしない（別PR）。
+  //  - PWA単体（開発者コンソール無し）でも調査できるよう、診断JSONを
+  //    画面からコピー／表示できる。
+  // ─────────────────────────────────────────────────────────────
+  const Diagnostics = (() => {
+    const PREFIX = 'mindlink_';
+    const LIMIT_KB = 5120;        // iOS Safari/PWA の localStorage 上限目安（約5MB）
+    const SOFT_LIMIT_KB = 4096;   // 4MB 超で警告
+    const HARD_LIMIT_KB = 4608;   // 4.5MB 超で強い警告
+    let _lastSend = null;         // 直近の送信サマリー（揮発）
+    let _lastSendFailure = null;  // 直近の送信中止（揮発）
+
+    function appVersion() {
+      try { return (typeof CACHE_NAME !== 'undefined') ? CACHE_NAME : 'unknown'; }
+      catch (_) { return 'unknown'; }
+    }
+    function isStandalone() {
+      return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+        || window.navigator.standalone === true;
+    }
+
+    function recordSend(info) { _lastSend = info; }
+    function recordSendFailure(info) { _lastSendFailure = info; }
+
+    // localStorage を「生で」走査して整合性を検査する。
+    // （storage.get() は parse 失敗を握り潰すため、ここでは getItem を直接使う）
+    function inspectStorage() {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(PREFIX)) keys.push(k);
+      }
+
+      // 登録済みスレッドID一覧
+      let registeredThreadIds = [];
+      try {
+        const rawThreads = localStorage.getItem(PREFIX + 'threads');
+        if (rawThreads) {
+          const parsed = JSON.parse(rawThreads);
+          if (Array.isArray(parsed)) registeredThreadIds = parsed.map(t => t && t.id).filter(Boolean);
+        }
+      } catch (_) { /* threads 自体の破損は下のループで parseFailures に入る */ }
+
+      let totalBytes = 0;
+      const parseFailures = [];
+      const keySizes = [];
+      const messageKeys = [];
+      const MSG_PREFIX = PREFIX + 'messages_';
+
+      for (const k of keys) {
+        const raw = localStorage.getItem(k) || '';
+        const bytes = (k.length + raw.length) * 2; // UTF-16 概算
+        totalBytes += bytes;
+        keySizes.push({ key: k, kb: +(bytes / 1024).toFixed(1) });
+
+        let parseOk = true, error = null, parsed = null;
+        try { parsed = JSON.parse(raw); }
+        catch (e) { parseOk = false; error = e.message; parseFailures.push(k); }
+
+        if (k.startsWith(MSG_PREFIX)) {
+          const threadId = k.slice(MSG_PREFIX.length);
+          messageKeys.push({
+            threadId,
+            count: (parseOk && Array.isArray(parsed)) ? parsed.length : 0,
+            parseOk,
+            error,
+            registered: registeredThreadIds.includes(threadId),
+          });
+        }
+      }
+
+      keySizes.sort((a, b) => b.kb - a.kb);
+      const orphanMessageKeys = messageKeys
+        .filter(m => !m.registered)
+        .map(m => MSG_PREFIX + m.threadId);
+
+      return {
+        totalBytes,
+        totalKB: +(totalBytes / 1024).toFixed(1),
+        topKeys: keySizes.slice(0, 8),
+        parseFailures,
+        messageKeys,
+        registeredThreadIds,
+        orphanMessageKeys,
+      };
+    }
+
+    // 完全な診断オブジェクトを組み立てる
+    function build() {
+      const s = inspectStorage();
+      const currentThreadId = (window.MindLinkThreads && MindLinkThreads.getCurrentThreadId)
+        ? MindLinkThreads.getCurrentThreadId()
+        : null;
+      const currentThreadExists = (currentThreadId == null)
+        ? null
+        : s.registeredThreadIds.includes(currentThreadId);
+
+      const issues = [];
+      if (s.parseFailures.length > 0)
+        issues.push('JSON parse 失敗: ' + s.parseFailures.join(', '));
+      if (s.orphanMessageKeys.length > 0)
+        issues.push('孤児 messages キー: ' + s.orphanMessageKeys.join(', '));
+      if (currentThreadId && currentThreadExists === false)
+        issues.push('currentThreadId が threads に存在しない: ' + currentThreadId);
+      if (s.totalKB > HARD_LIMIT_KB)
+        issues.push(`localStorage 逼迫(危険): ${s.totalKB}KB / ${LIMIT_KB}KB`);
+      else if (s.totalKB > SOFT_LIMIT_KB)
+        issues.push(`localStorage 使用量大: ${s.totalKB}KB / ${LIMIT_KB}KB`);
+      if (_lastSendFailure)
+        issues.push('直近の送信中止あり: ' + (_lastSendFailure.reason || 'unknown'));
+
+      return {
+        timestamp: new Date().toISOString(),
+        appVersion: appVersion(),
+        userAgent: navigator.userAgent,
+        isStandalone: isStandalone(),
+        isIOS: /iP(hone|ad|od)/.test(navigator.userAgent),
+        storage: {
+          totalBytes: s.totalBytes,
+          totalKB: s.totalKB,
+          limitKB: LIMIT_KB,
+          usagePercent: +((s.totalKB / LIMIT_KB) * 100).toFixed(1),
+          topKeys: s.topKeys,
+        },
+        threads: {
+          registeredCount: s.registeredThreadIds.length,
+          currentThreadId,
+          currentThreadExists,
+          orphanMessageKeys: s.orphanMessageKeys,
+        },
+        messages: {
+          byThread: s.messageKeys.map(m => ({
+            threadId: m.threadId,
+            count: m.count,
+            parseOk: m.parseOk,
+            registered: m.registered,
+            error: m.error || undefined,
+          })),
+        },
+        lastSend: _lastSend,
+        lastSendFailure: _lastSendFailure,
+        issues,
+      };
+    }
+
+    function asText() { return JSON.stringify(build(), null, 2); }
+    function dump() { const d = build(); console.log('[MindLink Diagnostics]', d); return d; }
+
+    // 診断JSONをコピー（3段フォールバック：clipboard API → execCommand → 手動選択）
+    async function copyToClipboard() {
+      const text = asText();
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          showToast('診断情報をコピーしました');
+          return true;
+        }
+      } catch (_) { /* フォールバックへ */ }
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) { showToast('診断情報をコピーしました'); return true; }
+      } catch (_) { /* フォールバックへ */ }
+      showManualCopy(text);
+      return false;
+    }
+
+    // コピー不可環境向け：手動で長押し選択できるオーバーレイ表示
+    function showManualCopy(text) {
+      const id = 'diag-manual-copy';
+      const exist = document.getElementById(id);
+      if (exist) exist.remove();
+      const overlay = document.createElement('div');
+      overlay.id = id;
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100001;display:flex;align-items:center;justify-content:center;padding:16px;';
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#fff;color:#111;max-width:560px;width:100%;max-height:80vh;border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:8px;';
+      const title = document.createElement('div');
+      title.textContent = '診断情報（長押しで全選択してコピーしてください）';
+      title.style.cssText = 'font-weight:600;font-size:14px;';
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.readOnly = true;
+      ta.style.cssText = 'flex:1;min-height:240px;width:100%;font-size:12px;font-family:monospace;white-space:pre;overflow:auto;box-sizing:border-box;';
+      const close = document.createElement('button');
+      close.textContent = '閉じる';
+      close.style.cssText = 'align-self:flex-end;padding:8px 16px;border:none;border-radius:8px;background:#333;color:#fff;';
+      close.onclick = () => overlay.remove();
+      box.append(title, ta, close);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+      ta.focus();
+    }
+
+    // 異常検知時の警告バナー（削除ボタンは持たない）
+    function showBanner(issueCount) {
+      const id = 'diag-banner';
+      if (document.getElementById(id)) return;
+      const bar = document.createElement('div');
+      bar.id = id;
+      bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:100000;background:#b3261e;color:#fff;font-size:13px;line-height:1.4;padding:8px 12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;box-shadow:0 2px 8px rgba(0,0,0,.3);';
+      const msg = document.createElement('span');
+      msg.style.flex = '1 1 auto';
+      msg.textContent = `⚠️ データ整合性に問題を検知しました（動作には影響ありません・${issueCount}件）`;
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.textContent = '📋 診断情報をコピー';
+      copyBtn.style.cssText = 'padding:6px 10px;border:none;border-radius:6px;background:#fff;color:#b3261e;font-weight:600;font-size:12px;cursor:pointer;';
+      copyBtn.onclick = () => copyToClipboard();
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.textContent = '✕';
+      closeBtn.setAttribute('aria-label', '閉じる');
+      closeBtn.style.cssText = 'padding:6px 10px;border:none;border-radius:6px;background:rgba(255,255,255,.2);color:#fff;font-size:12px;cursor:pointer;';
+      closeBtn.onclick = () => bar.remove();
+      bar.append(msg, copyBtn, closeBtn);
+      document.body.appendChild(bar);
+    }
+
+    // 起動時整合性チェック（検知・ログ・バナーのみ。削除はしない）
+    function runStartupCheck() {
+      try {
+        const d = build();
+        if (d.issues.length > 0) {
+          console.warn('[MindLink Diagnostics] 整合性の問題を検知:', d.issues, d);
+          showBanner(d.issues.length);
+        } else {
+          console.log('[MindLink Diagnostics] 整合性チェック OK', {
+            storageKB: d.storage.totalKB, threads: d.threads.registeredCount,
+          });
+        }
+      } catch (e) {
+        console.error('[MindLink Diagnostics] startup check failed:', e);
+      }
+    }
+
+    return {
+      recordSend, recordSendFailure,
+      build, dump, asText,
+      copyToClipboard, showBanner, runStartupCheck,
+    };
+  })();
+
+  window.__mindlinkDiag = Diagnostics;
+
   return {
     init,
     selectThread,
@@ -1249,6 +1881,10 @@ const MindLinkApp = (() => {
     closeAllModals,
     showConfirm,
     showToast,
+    showProgress,
+    hideProgress,
+    exportArchive,
+    importArchive,
     openSidebar,
     closeSidebar,
     applyTheme,
